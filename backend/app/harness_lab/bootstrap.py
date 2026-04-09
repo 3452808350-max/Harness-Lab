@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+from typing import Any, Optional
 
 from .boundary.gateway import ToolGateway
 from .constraints.engine import ConstraintEngine
 from .context.manager import ContextManager
+from .dispatch_queue import DispatchQueue, InMemoryDispatchQueue
 from .improvement.service import ImprovementService
 from .optimizer.service import OptimizerService
 from .orchestrator.service import OrchestratorService
 from .prompting.assembler import PromptAssembler
 from .runtime.models import ModelRegistry
 from .runtime.service import RuntimeService
-from .storage import HarnessLabDatabase
+from .settings import HarnessLabSettings
+from .storage import PlatformStore, PostgresPlatformStore
 from .types import ConstraintDocument, ContextProfile, HarnessPolicy, ModelProfile, PromptTemplate, WorkflowTemplateVersion
 from .utils import utc_now
 from .workers.service import WorkerService
@@ -20,8 +23,15 @@ from .workers.service import WorkerService
 class HarnessLabServices:
     """Service container and default catalog bootstrap."""
 
-    def __init__(self) -> None:
-        self.database = HarnessLabDatabase()
+    def __init__(
+        self,
+        settings: HarnessLabSettings,
+        database: PlatformStore,
+        dispatch_queue: DispatchQueue | InMemoryDispatchQueue,
+    ) -> None:
+        self.settings = settings
+        self.database = database
+        self.dispatch_queue = dispatch_queue
         self.constraint_engine = ConstraintEngine(self.database)
         self.context_manager = ContextManager(self.database)
         self.tool_gateway = ToolGateway(self.database, self.constraint_engine)
@@ -31,6 +41,7 @@ class HarnessLabServices:
         self.workers = WorkerService(self.database)
         self.runtime = RuntimeService(
             database=self.database,
+            dispatch_queue=self.dispatch_queue,
             context_manager=self.context_manager,
             constraint_engine=self.constraint_engine,
             tool_gateway=self.tool_gateway,
@@ -321,17 +332,31 @@ class HarnessLabServices:
         )
 
         self.workers.ensure_default_worker()
+        self.runtime.rebuild_dispatch_state()
+        self.runtime.reclaim_stale_leases()
 
     def doctor_report(self) -> dict:
+        self.runtime.reclaim_stale_leases()
         provider = self.runtime.get_model_provider_settings().model_dump()
         workers = self.workers.list_workers()
         candidates = self.improvement.list_candidates()
         evaluations = self.improvement.list_evaluations()
+        execution = self.runtime.execution_plane_status()
         warnings = []
         if not provider["model_ready"]:
             warnings.append("Model provider is not ready; runtime will use heuristic fallback.")
         if not workers:
             warnings.append("No workers are registered with the control plane.")
+        if not execution["postgres_ready"]:
+            warnings.append("Postgres truth source is not reachable.")
+        if not execution["redis_ready"]:
+            warnings.append("Redis dispatch queue is not reachable.")
+        if execution["offline_workers"]:
+            warnings.append(f"Offline workers detected: {', '.join(execution['offline_workers'])}.")
+        if execution["unhealthy_workers"]:
+            warnings.append(f"Unhealthy workers detected: {', '.join(execution['unhealthy_workers'])}.")
+        if execution["stuck_runs"]:
+            warnings.append(f"Stuck run candidates detected: {len(execution['stuck_runs'])}.")
         published_workflows = [item for item in self.improvement.list_workflows() if item.status == "published"]
         if not published_workflows:
             warnings.append("No published workflow template is available.")
@@ -346,15 +371,78 @@ class HarnessLabServices:
             "workers": {
                 "count": len(workers),
                 "healthy": len([item for item in workers if item.state in {"idle", "leased", "executing"}]),
+                "by_state": execution["worker_count_by_state"],
+                "unhealthy_workers": [item.worker_id for item in workers if item.state in {"offline", "unhealthy"}],
+                "active_workers": execution["active_workers"],
             },
+            "execution_plane": execution,
             "improvement_plane": {
                 "candidates": len(candidates),
                 "published_candidates": len([item for item in candidates if item.publish_status == "published"]),
                 "evaluations": len(evaluations),
             },
             "warnings": warnings,
-            "doctor_ready": provider["model_ready"] and bool(workers) and bool(published_workflows),
+            "doctor_ready": provider["model_ready"] and bool(workers) and bool(published_workflows) and execution["postgres_ready"] and execution["redis_ready"],
         }
 
+    def close(self) -> None:
+        self.dispatch_queue.close()
+        self.database.close()
 
-harness_lab_services = HarnessLabServices()
+_services: Optional[HarnessLabServices] = None
+
+
+def create_harness_lab_services(
+    settings: HarnessLabSettings | None = None,
+    database: PlatformStore | None = None,
+    dispatch_queue: DispatchQueue | InMemoryDispatchQueue | None = None,
+) -> HarnessLabServices:
+    active_settings = settings or HarnessLabSettings.from_env()
+    active_database = database or PostgresPlatformStore(
+        db_url=active_settings.db_url,
+        artifact_root=active_settings.resolved_artifact_root(),
+    )
+    active_queue = dispatch_queue or DispatchQueue(
+        redis_url=active_settings.redis_url,
+        namespace=active_settings.redis_namespace,
+    )
+    active_database.ping()
+    active_queue.ping()
+    return HarnessLabServices(active_settings, active_database, active_queue)
+
+
+def initialize_harness_lab_services(
+    settings: HarnessLabSettings | None = None,
+    database: PlatformStore | None = None,
+    dispatch_queue: DispatchQueue | InMemoryDispatchQueue | None = None,
+    force: bool = False,
+) -> HarnessLabServices:
+    global _services
+    if _services is not None and not force and settings is None and database is None and dispatch_queue is None:
+        return _services
+    if _services is not None and force:
+        _services.close()
+        _services = None
+    if _services is None or force:
+        _services = create_harness_lab_services(settings=settings, database=database, dispatch_queue=dispatch_queue)
+    return _services
+
+
+def get_harness_lab_services() -> HarnessLabServices:
+    return initialize_harness_lab_services()
+
+
+def shutdown_harness_lab_services() -> None:
+    global _services
+    if _services is None:
+        return
+    _services.close()
+    _services = None
+
+
+class _LazyHarnessLabServices:
+    def __getattr__(self, item: str) -> Any:
+        return getattr(get_harness_lab_services(), item)
+
+
+harness_lab_services = _LazyHarnessLabServices()

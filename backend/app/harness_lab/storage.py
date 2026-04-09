@@ -2,247 +2,539 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from .types import ApprovalRequestModel, ArtifactRef, EventEnvelope
+import psycopg
+from psycopg.rows import dict_row
+
+from .types import ApprovalRequestModel, ArtifactRef, EventEnvelope, Mission, TaskAttempt, WorkerLease
 from .utils import ensure_parent, json_dumps, new_id, utc_now
 
 
-class HarnessLabDatabase:
-    """SQLite and filesystem backing store for Harness Lab."""
+POSTGRES_SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        goal TEXT NOT NULL,
+        status TEXT NOT NULL,
+        active_policy_id TEXT NOT NULL,
+        workflow_template_id TEXT,
+        constraint_set_id TEXT NOT NULL,
+        context_profile_id TEXT NOT NULL,
+        prompt_template_id TEXT NOT NULL,
+        model_profile_id TEXT NOT NULL,
+        execution_mode TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        prompt_frame_id TEXT,
+        mission_id TEXT,
+        current_attempt_id TEXT,
+        active_lease_id TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS constraints_documents (
+        document_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS context_profiles (
+        context_profile_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS prompt_templates (
+        prompt_template_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_profiles (
+        model_profile_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        profile TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS harness_policies (
+        policy_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        constraint_set_id TEXT NOT NULL,
+        context_profile_id TEXT NOT NULL,
+        prompt_template_id TEXT NOT NULL,
+        model_profile_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS experiments (
+        experiment_id TEXT PRIMARY KEY,
+        scenario_suite TEXT NOT NULL,
+        status TEXT NOT NULL,
+        winner TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS replays (
+        replay_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        seq BIGSERIAL PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        session_id TEXT,
+        run_id TEXT,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS approvals (
+        approval_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        verdict_id TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        status TEXT NOT NULL,
+        decision TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        artifact_type TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS workflow_templates (
+        workflow_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS improvement_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_version_id TEXT NOT NULL,
+        publish_status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS evaluation_reports (
+        evaluation_id TEXT PRIMARY KEY,
+        candidate_id TEXT,
+        suite TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS failure_clusters (
+        cluster_id TEXT PRIMARY KEY,
+        signature TEXT NOT NULL UNIQUE,
+        frequency INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS workers (
+        worker_id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        state TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS missions (
+        mission_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        run_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS task_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        task_node_id TEXT NOT NULL,
+        worker_id TEXT,
+        lease_id TEXT,
+        status TEXT NOT NULL,
+        retry_index INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS worker_leases (
+        lease_id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        task_node_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        approval_token TEXT,
+        expires_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_approvals_run_id ON approvals(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_task_attempts_run_id ON task_attempts(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_worker_leases_run_id ON worker_leases(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_worker_leases_worker_id ON worker_leases(worker_id, created_at)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_leases_active_task
+    ON worker_leases(run_id, task_node_id)
+    WHERE status IN ('leased', 'running')
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_active_task
+    ON task_attempts(run_id, task_node_id)
+    WHERE status IN ('leased', 'running')
+    """,
+]
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
+SQLITE_SCHEMA_SCRIPT = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    status TEXT NOT NULL,
+    active_policy_id TEXT NOT NULL,
+    workflow_template_id TEXT,
+    constraint_set_id TEXT NOT NULL,
+    context_profile_id TEXT NOT NULL,
+    prompt_template_id TEXT NOT NULL,
+    model_profile_id TEXT NOT NULL,
+    execution_mode TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    prompt_frame_id TEXT,
+    mission_id TEXT,
+    current_attempt_id TEXT,
+    active_lease_id TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS constraints_documents (
+    document_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    status TEXT NOT NULL,
+    version TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_profiles (
+    context_profile_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prompt_templates (
+    prompt_template_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_profiles (
+    model_profile_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS harness_policies (
+    policy_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    constraint_set_id TEXT NOT NULL,
+    context_profile_id TEXT NOT NULL,
+    prompt_template_id TEXT NOT NULL,
+    model_profile_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    scenario_suite TEXT NOT NULL,
+    status TEXT NOT NULL,
+    winner TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replays (
+    replay_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    session_id TEXT,
+    run_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    verdict_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL,
+    decision TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    artifact_type TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflow_templates (
+    workflow_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS improvement_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_version_id TEXT NOT NULL,
+    publish_status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_reports (
+    evaluation_id TEXT PRIMARY KEY,
+    candidate_id TEXT,
+    suite TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS failure_clusters (
+    cluster_id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL UNIQUE,
+    frequency INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    state TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS missions (
+    mission_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_node_id TEXT NOT NULL,
+    worker_id TEXT,
+    lease_id TEXT,
+    status TEXT NOT NULL,
+    retry_index INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_leases (
+    lease_id TEXT PRIMARY KEY,
+    worker_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    task_node_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approval_token TEXT,
+    expires_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+class PlatformStore(ABC):
+    """Truth-source store for Harness Lab control-plane state."""
+
+    backend_name = "unknown"
+
+    def __init__(self, artifact_root: Optional[str] = None) -> None:
         self.repo_root = Path(__file__).resolve().parents[3]
         self.data_dir = self.repo_root / "backend" / "data" / "harness_lab"
-        self.artifact_root = self.data_dir / "artifacts"
+        self.artifact_root = Path(artifact_root) if artifact_root else self.data_dir / "artifacts"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
-        self.db_path = Path(db_path) if db_path else self.data_dir / "harness_lab.db"
-        self._initialize()
+
+    @abstractmethod
+    def ping(self) -> None:
+        """Raise if the backing store is unavailable."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release resources."""
 
     @contextmanager
-    def connection(self) -> Iterable[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
+    @abstractmethod
+    def connection(self) -> Iterator[Any]:
+        """Yield a DB connection."""
+
+    @contextmanager
+    def transaction(self) -> Iterator[Any]:
+        with self.connection() as conn:
             yield conn
-            conn.commit()
-        finally:
-            conn.close()
 
-    def _initialize(self) -> None:
-        with self.connection() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    goal TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    active_policy_id TEXT NOT NULL,
-                    constraint_set_id TEXT NOT NULL,
-                    context_profile_id TEXT NOT NULL,
-                    prompt_template_id TEXT NOT NULL,
-                    model_profile_id TEXT NOT NULL,
-                    execution_mode TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+    @abstractmethod
+    def execute(self, query: str, params: tuple = (), conn: Any | None = None) -> None:
+        """Execute a query."""
 
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    prompt_frame_id TEXT,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+    @abstractmethod
+    def fetchone(self, query: str, params: tuple = (), conn: Any | None = None) -> Optional[Dict[str, Any]]:
+        """Fetch one row as dict."""
 
-                CREATE TABLE IF NOT EXISTS constraints_documents (
-                    document_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    scope TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+    @abstractmethod
+    def fetchall(self, query: str, params: tuple = (), conn: Any | None = None) -> List[Dict[str, Any]]:
+        """Fetch many rows as dicts."""
 
-                CREATE TABLE IF NOT EXISTS context_profiles (
-                    context_profile_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS prompt_templates (
-                    prompt_template_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS model_profiles (
-                    model_profile_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    profile TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS harness_policies (
-                    policy_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    constraint_set_id TEXT NOT NULL,
-                    context_profile_id TEXT NOT NULL,
-                    prompt_template_id TEXT NOT NULL,
-                    model_profile_id TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS experiments (
-                    experiment_id TEXT PRIMARY KEY,
-                    scenario_suite TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    winner TEXT,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS replays (
-                    replay_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL UNIQUE,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS events (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    session_id TEXT,
-                    run_id TEXT,
-                    event_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS approvals (
-                    approval_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    verdict_id TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    decision TEXT,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS artifacts (
-                    artifact_id TEXT PRIMARY KEY,
-                    run_id TEXT,
-                    artifact_type TEXT NOT NULL,
-                    relative_path TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS workflow_templates (
-                    workflow_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS improvement_candidates (
-                    candidate_id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    target_version_id TEXT NOT NULL,
-                    publish_status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS evaluation_reports (
-                    evaluation_id TEXT PRIMARY KEY,
-                    candidate_id TEXT,
-                    suite TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS failure_clusters (
-                    cluster_id TEXT PRIMARY KEY,
-                    signature TEXT NOT NULL UNIQUE,
-                    frequency INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS workers (
-                    worker_id TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    heartbeat_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                """
-            )
-        self._ensure_schema_evolution()
-
-    def _ensure_schema_evolution(self) -> None:
-        self._ensure_column("sessions", "workflow_template_id", "TEXT")
-
-    def _ensure_column(self, table: str, column: str, column_type: str) -> None:
-        with self.connection() as conn:
-            existing_columns = {
-                row["name"]
-                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            if column in existing_columns:
-                return
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
-
-    def execute(self, query: str, params: tuple = ()) -> None:
-        with self.connection() as conn:
-            conn.execute(query, params)
-
-    def fetchone(self, query: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-        with self.connection() as conn:
-            row = conn.execute(query, params).fetchone()
-        return dict(row) if row is not None else None
-
-    def fetchall(self, query: str, params: tuple = ()) -> List[Dict[str, Any]]:
-        with self.connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-
-    def upsert_row(self, table: str, payload: Dict[str, Any], conflict_field: str) -> None:
+    def upsert_row(self, table: str, payload: Dict[str, Any], conflict_field: str, conn: Any | None = None) -> None:
         columns = list(payload.keys())
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(f"{column}=excluded.{column}" for column in columns if column != conflict_field)
@@ -250,7 +542,7 @@ class HarnessLabDatabase:
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
             f"ON CONFLICT({conflict_field}) DO UPDATE SET {updates}"
         )
-        self.execute(query, tuple(payload[column] for column in columns))
+        self.execute(query, tuple(payload[column] for column in columns), conn=conn)
 
     def append_event(
         self,
@@ -258,6 +550,7 @@ class HarnessLabDatabase:
         payload: Dict[str, Any],
         session_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        conn: Any | None = None,
     ) -> EventEnvelope:
         model = EventEnvelope(
             seq=0,
@@ -281,8 +574,9 @@ class HarnessLabDatabase:
                 json_dumps(model.payload),
                 model.created_at,
             ),
+            conn=conn,
         )
-        row = self.fetchone("SELECT * FROM events WHERE event_id = ?", (model.event_id,))
+        row = self.fetchone("SELECT * FROM events WHERE event_id = ?", (model.event_id,), conn=conn)
         return EventEnvelope(
             seq=row["seq"],
             event_id=row["event_id"],
@@ -299,6 +593,7 @@ class HarnessLabDatabase:
         run_id: Optional[str] = None,
         after_seq: int = 0,
         limit: int = 200,
+        conn: Any | None = None,
     ) -> List[EventEnvelope]:
         clauses = ["seq > ?"]
         params: List[Any] = [after_seq]
@@ -311,6 +606,7 @@ class HarnessLabDatabase:
         rows = self.fetchall(
             f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY seq ASC LIMIT ?",
             tuple(params + [limit]),
+            conn=conn,
         )
         return [
             EventEnvelope(
@@ -363,11 +659,11 @@ class HarnessLabDatabase:
             created_at=created_at,
         )
 
-    def list_artifacts(self, run_id: Optional[str] = None) -> List[ArtifactRef]:
+    def list_artifacts(self, run_id: Optional[str] = None, conn: Any | None = None) -> List[ArtifactRef]:
         if run_id:
-            rows = self.fetchall("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at DESC", (run_id,))
+            rows = self.fetchall("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at DESC", (run_id,), conn=conn)
         else:
-            rows = self.fetchall("SELECT * FROM artifacts ORDER BY created_at DESC")
+            rows = self.fetchall("SELECT * FROM artifacts ORDER BY created_at DESC", conn=conn)
         return [
             ArtifactRef(
                 artifact_id=row["artifact_id"],
@@ -380,6 +676,21 @@ class HarnessLabDatabase:
             for row in rows
         ]
 
+    def record_artifact_ref(self, artifact: ArtifactRef, conn: Any | None = None) -> None:
+        self.upsert_row(
+            "artifacts",
+            {
+                "artifact_id": artifact.artifact_id,
+                "run_id": artifact.run_id,
+                "artifact_type": artifact.artifact_type,
+                "relative_path": artifact.relative_path,
+                "payload_json": json_dumps(artifact.metadata),
+                "created_at": artifact.created_at,
+            },
+            "artifact_id",
+            conn=conn,
+        )
+
     def create_approval(
         self,
         run_id: str,
@@ -387,6 +698,7 @@ class HarnessLabDatabase:
         subject: str,
         summary: str,
         payload: Dict[str, Any],
+        conn: Any | None = None,
     ) -> ApprovalRequestModel:
         approval = ApprovalRequestModel(
             approval_id=new_id("approval"),
@@ -417,11 +729,12 @@ class HarnessLabDatabase:
                 approval.created_at,
                 approval.updated_at,
             ),
+            conn=conn,
         )
         return approval
 
-    def get_approval(self, approval_id: str) -> ApprovalRequestModel:
-        row = self.fetchone("SELECT * FROM approvals WHERE approval_id = ?", (approval_id,))
+    def get_approval(self, approval_id: str, conn: Any | None = None) -> ApprovalRequestModel:
+        row = self.fetchone("SELECT * FROM approvals WHERE approval_id = ?", (approval_id,), conn=conn)
         if not row:
             raise ValueError("Approval not found")
         payload = json.loads(row["payload_json"])
@@ -430,7 +743,12 @@ class HarnessLabDatabase:
         payload["updated_at"] = row["updated_at"]
         return ApprovalRequestModel(**payload)
 
-    def list_approvals(self, run_id: Optional[str] = None, status: Optional[str] = None) -> List[ApprovalRequestModel]:
+    def list_approvals(
+        self,
+        run_id: Optional[str] = None,
+        status: Optional[str] = None,
+        conn: Any | None = None,
+    ) -> List[ApprovalRequestModel]:
         clauses: List[str] = []
         params: List[Any] = []
         if run_id:
@@ -440,7 +758,7 @@ class HarnessLabDatabase:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.fetchall(f"SELECT * FROM approvals {where} ORDER BY created_at DESC", tuple(params))
+        rows = self.fetchall(f"SELECT * FROM approvals {where} ORDER BY created_at DESC", tuple(params), conn=conn)
         output: List[ApprovalRequestModel] = []
         for row in rows:
             payload = json.loads(row["payload_json"])
@@ -450,8 +768,8 @@ class HarnessLabDatabase:
             output.append(ApprovalRequestModel(**payload))
         return output
 
-    def resolve_approval(self, approval_id: str, decision: str) -> ApprovalRequestModel:
-        approval = self.get_approval(approval_id)
+    def resolve_approval(self, approval_id: str, decision: str, conn: Any | None = None) -> ApprovalRequestModel:
+        approval = self.get_approval(approval_id, conn=conn)
         now = utc_now()
         status = "approved" if decision in {"approve", "approve_once"} else "denied"
         approval.status = status
@@ -460,10 +778,11 @@ class HarnessLabDatabase:
         self.execute(
             "UPDATE approvals SET status = ?, decision = ?, payload_json = ?, updated_at = ? WHERE approval_id = ?",
             (status, decision, json_dumps(approval.model_dump()), now, approval_id),
+            conn=conn,
         )
         return approval
 
-    def upsert_replay(self, replay_id: str, run_id: str, payload: Dict[str, Any]) -> None:
+    def upsert_replay(self, replay_id: str, run_id: str, payload: Dict[str, Any], conn: Any | None = None) -> None:
         now = utc_now()
         self.upsert_row(
             "replays",
@@ -475,13 +794,329 @@ class HarnessLabDatabase:
                 "updated_at": now,
             },
             "replay_id",
+            conn=conn,
         )
 
-    def get_replay(self, replay_id: str) -> Optional[Dict[str, Any]]:
-        row = self.fetchone("SELECT * FROM replays WHERE replay_id = ? OR run_id = ?", (replay_id, replay_id))
+    def get_replay(self, replay_id: str, conn: Any | None = None) -> Optional[Dict[str, Any]]:
+        row = self.fetchone("SELECT * FROM replays WHERE replay_id = ? OR run_id = ?", (replay_id, replay_id), conn=conn)
         if not row:
             return None
         payload = json.loads(row["payload_json"])
         payload["replay_id"] = row["replay_id"]
         payload["updated_at"] = row["updated_at"]
         return payload
+
+    def upsert_mission(self, mission: Mission, conn: Any | None = None) -> None:
+        self.upsert_row(
+            "missions",
+            {
+                "mission_id": mission.mission_id,
+                "session_id": mission.session_id,
+                "run_id": mission.run_id,
+                "status": mission.status,
+                "payload_json": json_dumps(mission.model_dump()),
+                "created_at": mission.created_at,
+                "updated_at": mission.updated_at,
+            },
+            "mission_id",
+            conn=conn,
+        )
+
+    def get_mission_by_run(self, run_id: str, conn: Any | None = None) -> Optional[Mission]:
+        row = self.fetchone("SELECT payload_json FROM missions WHERE run_id = ?", (run_id,), conn=conn)
+        if not row:
+            return None
+        return Mission(**json.loads(row["payload_json"]))
+
+    def list_missions(self, status: Optional[str] = None, conn: Any | None = None) -> List[Mission]:
+        if status:
+            rows = self.fetchall(
+                "SELECT payload_json FROM missions WHERE status = ? ORDER BY created_at ASC",
+                (status,),
+                conn=conn,
+            )
+        else:
+            rows = self.fetchall("SELECT payload_json FROM missions ORDER BY created_at ASC", conn=conn)
+        return [Mission(**json.loads(row["payload_json"])) for row in rows]
+
+    def upsert_attempt(self, attempt: TaskAttempt, conn: Any | None = None) -> None:
+        self.upsert_row(
+            "task_attempts",
+            {
+                "attempt_id": attempt.attempt_id,
+                "run_id": attempt.run_id,
+                "task_node_id": attempt.task_node_id,
+                "worker_id": attempt.worker_id,
+                "lease_id": attempt.lease_id,
+                "status": attempt.status,
+                "retry_index": attempt.retry_index,
+                "payload_json": json_dumps(attempt.model_dump()),
+                "created_at": attempt.created_at,
+                "updated_at": attempt.updated_at,
+            },
+            "attempt_id",
+            conn=conn,
+        )
+
+    def get_attempt(self, attempt_id: str, conn: Any | None = None) -> TaskAttempt:
+        row = self.fetchone("SELECT payload_json FROM task_attempts WHERE attempt_id = ?", (attempt_id,), conn=conn)
+        if not row:
+            raise ValueError("Task attempt not found")
+        return TaskAttempt(**json.loads(row["payload_json"]))
+
+    def list_attempts(self, run_id: Optional[str] = None, conn: Any | None = None) -> List[TaskAttempt]:
+        if run_id:
+            rows = self.fetchall(
+                "SELECT payload_json FROM task_attempts WHERE run_id = ? ORDER BY created_at ASC",
+                (run_id,),
+                conn=conn,
+            )
+        else:
+            rows = self.fetchall("SELECT payload_json FROM task_attempts ORDER BY created_at ASC", conn=conn)
+        return [TaskAttempt(**json.loads(row["payload_json"])) for row in rows]
+
+    def upsert_lease(self, lease: WorkerLease, conn: Any | None = None) -> None:
+        self.upsert_row(
+            "worker_leases",
+            {
+                "lease_id": lease.lease_id,
+                "worker_id": lease.worker_id,
+                "run_id": lease.run_id,
+                "task_node_id": lease.task_node_id,
+                "attempt_id": lease.attempt_id,
+                "status": lease.status,
+                "approval_token": lease.approval_token,
+                "expires_at": lease.expires_at,
+                "heartbeat_at": lease.heartbeat_at,
+                "payload_json": json_dumps(lease.model_dump()),
+                "created_at": lease.created_at,
+                "updated_at": lease.updated_at,
+            },
+            "lease_id",
+            conn=conn,
+        )
+
+    def get_lease(self, lease_id: str, conn: Any | None = None) -> WorkerLease:
+        row = self.fetchone("SELECT payload_json FROM worker_leases WHERE lease_id = ?", (lease_id,), conn=conn)
+        if not row:
+            raise ValueError("Worker lease not found")
+        return WorkerLease(**json.loads(row["payload_json"]))
+
+    def list_leases(
+        self,
+        run_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        status: Optional[str] = None,
+        conn: Any | None = None,
+    ) -> List[WorkerLease]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if worker_id:
+            clauses.append("worker_id = ?")
+            params.append(worker_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.fetchall(
+            f"SELECT payload_json FROM worker_leases {where} ORDER BY created_at ASC",
+            tuple(params),
+            conn=conn,
+        )
+        return [WorkerLease(**json.loads(row["payload_json"])) for row in rows]
+
+
+class BaseSqlPlatformStore(PlatformStore):
+    """Shared SQL helpers for production Postgres and test SQLite stores."""
+
+    def __init__(self, artifact_root: Optional[str] = None) -> None:
+        super().__init__(artifact_root=artifact_root)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        for statement in self._schema_statements():
+            self.execute(statement)
+        self._ensure_schema_evolution()
+
+    @abstractmethod
+    def _schema_statements(self) -> List[str]:
+        """Return DDL statements."""
+
+    @abstractmethod
+    def _ensure_schema_evolution(self) -> None:
+        """Handle light schema evolution."""
+
+    @abstractmethod
+    def _translate_query(self, query: str) -> str:
+        """Convert repo SQL into backend SQL."""
+
+    @abstractmethod
+    def _normalize_rows(self, rows: Iterable[Any]) -> List[Dict[str, Any]]:
+        """Convert backend rows to dicts."""
+
+
+class PostgresPlatformStore(BaseSqlPlatformStore):
+    backend_name = "postgresql"
+
+    def __init__(self, db_url: str, artifact_root: Optional[str] = None) -> None:
+        self.db_url = db_url
+        super().__init__(artifact_root=artifact_root)
+
+    @contextmanager
+    def connection(self) -> Iterator[psycopg.Connection]:
+        conn = psycopg.connect(self.db_url, row_factory=dict_row)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def ping(self) -> None:
+        with self.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+
+    def close(self) -> None:
+        return None
+
+    def _schema_statements(self) -> List[str]:
+        return POSTGRES_SCHEMA_STATEMENTS
+
+    def _ensure_schema_evolution(self) -> None:
+        statements = [
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workflow_template_id TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS mission_id TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS current_attempt_id TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS active_lease_id TEXT",
+            "ALTER TABLE worker_leases ADD COLUMN IF NOT EXISTS approval_token TEXT",
+        ]
+        for statement in statements:
+            self.execute(statement)
+
+    def _translate_query(self, query: str) -> str:
+        return query.replace("?", "%s")
+
+    def _normalize_rows(self, rows: Iterable[Any]) -> List[Dict[str, Any]]:
+        return [dict(row) for row in rows]
+
+    def execute(self, query: str, params: tuple = (), conn: Any | None = None) -> None:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                with owned.cursor() as cursor:
+                    cursor.execute(translated, params)
+            return
+        with conn.cursor() as cursor:
+            cursor.execute(translated, params)
+
+    def fetchone(self, query: str, params: tuple = (), conn: Any | None = None) -> Optional[Dict[str, Any]]:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                with owned.cursor() as cursor:
+                    cursor.execute(translated, params)
+                    row = cursor.fetchone()
+        else:
+            with conn.cursor() as cursor:
+                cursor.execute(translated, params)
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def fetchall(self, query: str, params: tuple = (), conn: Any | None = None) -> List[Dict[str, Any]]:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                with owned.cursor() as cursor:
+                    cursor.execute(translated, params)
+                    rows = cursor.fetchall()
+        else:
+            with conn.cursor() as cursor:
+                cursor.execute(translated, params)
+                rows = cursor.fetchall()
+        return self._normalize_rows(rows)
+
+
+class SqliteTestPlatformStore(BaseSqlPlatformStore):
+    """SQLite-backed store kept only for local tests and injected fakes."""
+
+    backend_name = "sqlite_test"
+
+    def __init__(self, db_path: Optional[str] = None, artifact_root: Optional[str] = None) -> None:
+        self.db_path = Path(db_path) if db_path else (Path(__file__).resolve().parents[3] / "backend" / "data" / "harness_lab" / "test_harness_lab.db")
+        super().__init__(artifact_root=artifact_root)
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def ping(self) -> None:
+        with self.connection() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+    def close(self) -> None:
+        return None
+
+    def _schema_statements(self) -> List[str]:
+        return [statement for statement in SQLITE_SCHEMA_SCRIPT.split(";\n\n") if statement.strip()]
+
+    def _ensure_schema_evolution(self) -> None:
+        self._ensure_column("sessions", "workflow_template_id", "TEXT")
+        self._ensure_column("runs", "mission_id", "TEXT")
+        self._ensure_column("runs", "current_attempt_id", "TEXT")
+        self._ensure_column("runs", "active_lease_id", "TEXT")
+        self._ensure_column("worker_leases", "approval_token", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, column_type: str) -> None:
+        with self.connection() as conn:
+            existing_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column in existing_columns:
+                return
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+    def _translate_query(self, query: str) -> str:
+        return query.replace(" FOR UPDATE", "")
+
+    def _normalize_rows(self, rows: Iterable[Any]) -> List[Dict[str, Any]]:
+        return [dict(row) for row in rows]
+
+    def execute(self, query: str, params: tuple = (), conn: Any | None = None) -> None:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                owned.execute(translated, params)
+            return
+        conn.execute(translated, params)
+
+    def fetchone(self, query: str, params: tuple = (), conn: Any | None = None) -> Optional[Dict[str, Any]]:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                row = owned.execute(translated, params).fetchone()
+        else:
+            row = conn.execute(translated, params).fetchone()
+        return dict(row) if row is not None else None
+
+    def fetchall(self, query: str, params: tuple = (), conn: Any | None = None) -> List[Dict[str, Any]]:
+        translated = self._translate_query(query)
+        if conn is None:
+            with self.connection() as owned:
+                rows = owned.execute(translated, params).fetchall()
+        else:
+            rows = conn.execute(translated, params).fetchall()
+        return self._normalize_rows(rows)
+
+
+HarnessLabDatabase = PlatformStore

@@ -91,7 +91,7 @@ class OrchestratorService:
         nodes_by_id = {node.node_id: node for node in task_graph.nodes}
         ready: List[TaskNode] = []
         for node in task_graph.nodes:
-            if node.status != "planned":
+            if node.status not in {"planned", "ready"}:
                 continue
             inbound_edges = [edge for edge in task_graph.edges if edge.target == node.node_id]
             if not inbound_edges:
@@ -118,7 +118,7 @@ class OrchestratorService:
         nodes_by_id = {node.node_id: node for node in task_graph.nodes}
         skipped: List[TaskNode] = []
         for node in task_graph.nodes:
-            if node.status != "planned":
+            if node.status not in {"planned", "ready"}:
                 continue
             inbound_edges = [edge for edge in task_graph.edges if edge.target == node.node_id]
             if not inbound_edges:

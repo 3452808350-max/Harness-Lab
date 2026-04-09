@@ -35,6 +35,9 @@ CandidatePublishStatus = Literal["draft", "evaluating", "awaiting_approval", "pu
 EvaluationStatus = Literal["pending", "passed", "failed"]
 EvaluationSuite = Literal["replay", "benchmark"]
 WorkerState = Literal["registering", "idle", "leased", "executing", "draining", "offline", "unhealthy"]
+MissionStatus = Literal["queued", "running", "awaiting_approval", "completed", "failed", "cancelled"]
+AttemptStatus = Literal["leased", "running", "completed", "failed", "blocked", "released", "expired"]
+LeaseStatus = Literal["leased", "running", "completed", "failed", "released", "expired"]
 
 
 class ActionPlan(BaseModel):
@@ -289,9 +292,12 @@ class ResearchRun(BaseModel):
     run_id: str
     session_id: str
     status: RunStatus
+    mission_id: Optional[str] = None
     policy_id: Optional[str] = None
     workflow_template_id: Optional[str] = None
     assigned_worker_id: Optional[str] = None
+    current_attempt_id: Optional[str] = None
+    active_lease_id: Optional[str] = None
     prompt_frame: Optional[PromptFrame] = None
     execution_trace: Optional[ExecutionTrace] = None
     result: Dict[str, Any] = Field(default_factory=dict)
@@ -404,13 +410,133 @@ class WorkerSnapshot(BaseModel):
     label: str
     state: WorkerState
     capabilities: List[str] = Field(default_factory=list)
+    hostname: Optional[str] = None
+    pid: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
+    execution_mode: str = "embedded"
     heartbeat_at: str
     lease_count: int = 0
     version: str = "v1"
     current_run_id: Optional[str] = None
     current_task_node_id: Optional[str] = None
+    current_lease_id: Optional[str] = None
     last_error: Optional[str] = None
     created_at: str
+    updated_at: str
+
+
+class Mission(BaseModel):
+    mission_id: str
+    session_id: str
+    run_id: str
+    status: MissionStatus
+    created_at: str
+    updated_at: str
+
+
+class TaskAttempt(BaseModel):
+    attempt_id: str
+    run_id: str
+    task_node_id: str
+    worker_id: Optional[str] = None
+    lease_id: Optional[str] = None
+    status: AttemptStatus
+    retry_index: int = 0
+    summary: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class WorkerLease(BaseModel):
+    lease_id: str
+    worker_id: str
+    run_id: str
+    task_node_id: str
+    attempt_id: str
+    status: LeaseStatus
+    approval_token: Optional[str] = None
+    expires_at: str
+    heartbeat_at: str
+    created_at: str
+    updated_at: str
+
+
+class DispatchEnvelope(BaseModel):
+    lease_id: str
+    attempt_id: str
+    run_id: str
+    task_node_id: str
+    task_node: TaskNode
+    intent: IntentDeclaration
+    mission_id: Optional[str] = None
+    context_packet_ref: Optional[str] = None
+    prompt_frame_ref: Optional[str] = None
+    policy_verdicts: List[PolicyVerdict] = Field(default_factory=list)
+    budget: Dict[str, Any] = Field(default_factory=dict)
+    tool_policy: Dict[str, Any] = Field(default_factory=dict)
+    approval_token: Optional[str] = None
+    lease_timeout_seconds: int = 30
+    heartbeat_interval_seconds: int = 10
+    run_status_hint: Optional[str] = None
+    created_at: str
+
+
+class WorkerEventRecord(BaseModel):
+    event_type: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerEventBatch(BaseModel):
+    lease_id: str
+    events: List[WorkerEventRecord] = Field(default_factory=list)
+    model_calls: List[ModelCallTrace] = Field(default_factory=list)
+    tool_calls: List[ToolCallRecord] = Field(default_factory=list)
+    artifacts: List[ArtifactRef] = Field(default_factory=list)
+    recovery_events: List[RecoveryEvent] = Field(default_factory=list)
+    emitted_at: str
+
+
+class LeaseTransitionContext(BaseModel):
+    lease: WorkerLease
+    attempt: TaskAttempt
+    run: ResearchRun
+    session: ResearchSession
+    task_node: TaskNode
+    timestamp: str
+
+
+class RunCoordinationSnapshot(BaseModel):
+    run_id: str
+    mission_status: Optional[str] = None
+    counts_by_status: Dict[str, int] = Field(default_factory=dict)
+    node_ids_by_status: Dict[str, List[str]] = Field(default_factory=dict)
+    active_lease_id: Optional[str] = None
+    current_attempt_id: Optional[str] = None
+    updated_at: str
+
+
+class WorkerHealthSummary(BaseModel):
+    worker_id: str
+    derived_state: WorkerState
+    active_lease_count: int = 0
+    recent_lease_ids: List[str] = Field(default_factory=list)
+    recent_error_events: List[Dict[str, Any]] = Field(default_factory=list)
+    last_event_types: List[str] = Field(default_factory=list)
+    last_heartbeat_at: str
+    current_run_id: Optional[str] = None
+    current_task_node_id: Optional[str] = None
+
+
+class StuckRunSummary(BaseModel):
+    run_id: str
+    session_id: str
+    status: RunStatus
+    mission_status: Optional[MissionStatus] = None
+    reason: str
+    age_seconds: int
     updated_at: str
 
 
@@ -545,6 +671,10 @@ class WorkerRegisterRequest(BaseModel):
     worker_id: Optional[str] = None
     label: str = "local-worker"
     capabilities: List[str] = Field(default_factory=list)
+    hostname: Optional[str] = None
+    pid: Optional[int] = None
+    labels: List[str] = Field(default_factory=list)
+    execution_mode: str = "embedded"
     version: str = "v1"
 
 
@@ -553,4 +683,33 @@ class WorkerHeartbeatRequest(BaseModel):
     lease_count: int = 0
     current_run_id: Optional[str] = None
     current_task_node_id: Optional[str] = None
+    current_lease_id: Optional[str] = None
     last_error: Optional[str] = None
+
+
+class WorkerPollRequest(BaseModel):
+    max_tasks: int = 1
+
+
+class WorkerPollResponse(BaseModel):
+    dispatches: List[DispatchEnvelope] = Field(default_factory=list)
+
+
+class LeaseSweepReport(BaseModel):
+    scanned: int = 0
+    reclaimed: int = 0
+    expired_lease_ids: List[str] = Field(default_factory=list)
+
+
+class LeaseCompletionRequest(BaseModel):
+    worker_event_batch: Optional[WorkerEventBatch] = None
+    summary: Optional[str] = None
+
+
+class LeaseFailureRequest(BaseModel):
+    worker_event_batch: Optional[WorkerEventBatch] = None
+    error: str
+
+
+class LeaseReleaseRequest(BaseModel):
+    reason: Optional[str] = None

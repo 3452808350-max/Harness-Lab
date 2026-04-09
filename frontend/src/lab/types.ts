@@ -159,12 +159,54 @@ export interface ResearchRun {
   run_id: string
   session_id: string
   status: string
+  mission_id?: string | null
   policy_id?: string | null
   workflow_template_id?: string | null
   assigned_worker_id?: string | null
+  current_attempt_id?: string | null
+  active_lease_id?: string | null
   prompt_frame?: PromptFrame
   execution_trace?: ExecutionTrace
   result: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export interface Mission {
+  mission_id: string
+  session_id: string
+  run_id: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskAttempt {
+  attempt_id: string
+  run_id: string
+  task_node_id: string
+  worker_id?: string | null
+  lease_id?: string | null
+  status: string
+  retry_index: number
+  summary?: string | null
+  error?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface WorkerLease {
+  lease_id: string
+  worker_id: string
+  run_id: string
+  task_node_id: string
+  attempt_id: string
+  status: string
+  approval_token?: string | null
+  expires_at: string
+  heartbeat_at: string
   created_at: string
   updated_at: string
 }
@@ -173,9 +215,15 @@ export interface RunDetail {
   success: boolean
   data: ResearchRun
   session?: ResearchSession
+  mission?: Mission | null
+  coordination_snapshot?: Record<string, unknown>
+  timeline_summary?: Record<string, unknown>
+  status_summary?: Record<string, unknown>
   active_policy?: HarnessPolicy | null
   workflow_template?: WorkflowTemplateVersion | null
   worker?: WorkerSnapshot | null
+  attempts: TaskAttempt[]
+  leases: WorkerLease[]
   events: EventEnvelope[]
   approvals: ApprovalRequest[]
   artifacts: ArtifactRef[]
@@ -185,9 +233,12 @@ export interface ReplayEnvelope {
   replay_id?: string
   run: ResearchRun
   session: ResearchSession
+  mission?: Mission | null
   events: EventEnvelope[]
   approvals: ApprovalRequest[]
   artifacts: ArtifactRef[]
+  attempts?: TaskAttempt[]
+  leases?: WorkerLease[]
 }
 
 export interface ConstraintDocument {
@@ -339,11 +390,16 @@ export interface WorkerSnapshot {
   label: string
   state: string
   capabilities: string[]
+  hostname?: string | null
+  pid?: number | null
+  labels?: string[]
+  execution_mode?: string
   heartbeat_at: string
   lease_count: number
   version: string
   current_run_id?: string | null
   current_task_node_id?: string | null
+  current_lease_id?: string | null
   last_error?: string | null
   created_at: string
   updated_at: string
@@ -371,6 +427,7 @@ export interface SettingsCatalog {
   workers?: WorkerSnapshot[]
   tools: Array<Record<string, unknown>>
   model_provider?: Record<string, unknown>
+  execution_plane?: Record<string, unknown>
 }
 
 export interface SessionRequest {

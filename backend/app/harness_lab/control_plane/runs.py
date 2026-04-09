@@ -38,13 +38,20 @@ async def get_run(run_id: str):
             worker = harness_lab_services.workers.get_worker(run.assigned_worker_id).model_dump()
         except ValueError:
             worker = None
+    mission = harness_lab_services.runtime.get_mission(run_id)
     return {
         "success": True,
         "data": run.model_dump(),
         "session": session.model_dump(),
+        "mission": mission.model_dump() if mission else None,
+        "coordination_snapshot": harness_lab_services.runtime.run_coordination_snapshot(run_id).model_dump(),
+        "timeline_summary": harness_lab_services.runtime.run_timeline_summary(run_id),
+        "status_summary": harness_lab_services.runtime.run_status_summary(run_id),
         "active_policy": active_policy.model_dump(),
         "workflow_template": workflow.model_dump() if workflow else None,
         "worker": worker,
+        "attempts": [attempt.model_dump() for attempt in harness_lab_services.runtime.list_attempts(run_id=run_id)],
+        "leases": [lease.model_dump() for lease in harness_lab_services.runtime.list_leases(run_id=run_id)],
         "events": [event.model_dump() for event in harness_lab_services.runtime.list_events(run_id=run_id)],
         "approvals": [approval.model_dump() for approval in harness_lab_services.database.list_approvals(run_id=run_id)],
         "artifacts": [artifact.model_dump() for artifact in harness_lab_services.database.list_artifacts(run_id=run_id)],

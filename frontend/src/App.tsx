@@ -49,6 +49,7 @@ import type {
   ResearchSession,
   SettingsCatalog,
   SessionDetail,
+  WorkerLease,
   RunDetail,
   WorkerSnapshot,
   WorkflowTemplateVersion,
@@ -113,6 +114,7 @@ function App() {
   const [selectedEvaluationId, setSelectedEvaluationId] = useState<string | null>(null)
   const [failureClusters, setFailureClusters] = useState<FailureCluster[]>([])
   const [workers, setWorkers] = useState<WorkerSnapshot[]>([])
+  const [leases, setLeases] = useState<WorkerLease[]>([])
   const [experiments, setExperiments] = useState<ExperimentRun[]>([])
   const [catalog, setCatalog] = useState<SettingsCatalog | null>(null)
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
@@ -166,6 +168,7 @@ function App() {
       evaluationEnvelope,
       failureClusterEnvelope,
       workerEnvelope,
+      leaseEnvelope,
       experimentEnvelope,
       approvalEnvelope,
       catalogEnvelope,
@@ -179,6 +182,7 @@ function App() {
         api.listEvaluations(),
         api.listFailureClusters(),
         api.listWorkers(),
+        api.listLeases(),
         api.listExperiments(),
         api.listApprovals(),
         api.settingsCatalog(),
@@ -193,6 +197,7 @@ function App() {
     setSelectedEvaluationId((current) => current || evaluationEnvelope.data[0]?.evaluation_id || null)
     setFailureClusters(failureClusterEnvelope.data)
     setWorkers(workerEnvelope.data)
+    setLeases(leaseEnvelope.data)
     setExperiments(experimentEnvelope.data)
     setApprovals(approvalEnvelope.data)
     setCatalog(catalogEnvelope.data)
@@ -685,6 +690,12 @@ function App() {
                 showIcon
               />
               <JsonCard title="Assigned Worker" value={runDetail.worker || {}} />
+              <JsonCard title="Mission" value={runDetail.mission || {}} />
+              <JsonCard title="Run Status Summary" value={runDetail.status_summary || {}} />
+              <JsonCard title="Coordination Snapshot" value={runDetail.coordination_snapshot || {}} />
+              <JsonCard title="Timeline Summary" value={runDetail.timeline_summary || {}} />
+              <JsonCard title="Task Attempts" value={runDetail.attempts || []} />
+              <JsonCard title="Worker Leases" value={runDetail.leases || []} />
               <JsonCard title="Active Policy" value={runDetail.active_policy || {}} />
               <JsonCard title="Workflow Template" value={runDetail.workflow_template || {}} />
               <JsonCard title="Model Calls" value={runDetail.data.execution_trace?.model_calls || []} />
@@ -959,7 +970,21 @@ function App() {
       </Col>
       <Col xs={24} xl={16}>
         <Card className="lab-panel" title="Mission Control Catalog">
+          <JsonCard
+            title="Fleet Health"
+            value={{
+              active_workers: health?.active_workers || [],
+              offline_workers: health?.offline_workers || [],
+              unhealthy_workers: health?.unhealthy_workers || [],
+              stuck_runs: health?.stuck_runs || [],
+            }}
+          />
+          <Divider />
+          <JsonCard title="Execution Plane" value={catalog?.execution_plane || {}} />
+          <Divider />
           <JsonCard title="Workers" value={workers} />
+          <Divider />
+          <JsonCard title="Leases" value={leases} />
           <Divider />
           <JsonCard title="Settings Catalog" value={catalog || {}} />
         </Card>

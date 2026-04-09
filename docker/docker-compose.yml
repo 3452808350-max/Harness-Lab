@@ -1,4 +1,28 @@
 services:
+  harness-lab-postgres:
+    image: docker.1ms.run/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: harness_lab
+      POSTGRES_USER: harness_lab
+      POSTGRES_PASSWORD: harness_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - agent-os-network
+
+  harness-lab-redis:
+    image: docker.1ms.run/library/redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - agent-os-network
+
   agent-os-backend:
     build:
       context: ../
@@ -12,9 +36,17 @@ services:
       - PORT=4600
       - DEBUG=False
       - PYTHONPATH=/app
+      - HARNESS_DB_URL=${HARNESS_DB_URL:-postgresql://harness_lab:harness_lab@harness-lab-postgres:5432/harness_lab}
+      - HARNESS_REDIS_URL=${HARNESS_REDIS_URL:-redis://harness-lab-redis:6379/0}
+      - HARNESS_REDIS_NAMESPACE=${HARNESS_REDIS_NAMESPACE:-harness_lab}
     volumes:
       - ../backend/data:/app/backend/data:rw
     restart: unless-stopped
+    depends_on:
+      harness-lab-postgres:
+        condition: service_started
+      harness-lab-redis:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python3", "health-check.py"]
       interval: 30s
@@ -45,3 +77,7 @@ services:
 networks:
   agent-os-network:
     driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:

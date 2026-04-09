@@ -19,6 +19,7 @@ import type {
   SessionRequest,
   SettingsCatalog,
   ApprovalRequest,
+  WorkerLease,
   WorkerSnapshot,
   WorkflowTemplateVersion,
 } from './types'
@@ -158,6 +159,7 @@ export const api = {
     }),
   listFailureClusters: async () => request<FailureCluster[]>('/api/failure-clusters'),
   listWorkers: async () => request<WorkerSnapshot[]>('/api/workers'),
+  listLeases: async () => request<WorkerLease[]>('/api/leases'),
   registerWorker: async (payload: { label?: string; capabilities?: string[]; version?: string }) =>
     request<WorkerSnapshot>('/api/workers', {
       method: 'POST',

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..boundary.gateway import ToolGateway
 from ..constraints.engine import ConstraintEngine
 from ..context.manager import ContextManager
+from ..dispatch_queue import DispatchQueue, InMemoryDispatchQueue
 from ..prompting.assembler import PromptAssembler
-from ..storage import HarnessLabDatabase
+from ..storage import PlatformStore
 from ..types import (
     ApprovalRequestModel,
     ContextAssembleRequest,
@@ -20,6 +22,7 @@ from ..types import (
     IntentRequest,
     ModelProfile,
     ModelProviderSettings,
+    Mission,
     PolicyVerdict,
     PromptFrame,
     PromptRenderRequest,
@@ -29,14 +32,27 @@ from ..types import (
     ResearchSession,
     RunRequest,
     SessionRequest,
+    DispatchEnvelope,
+    LeaseCompletionRequest,
+    LeaseFailureRequest,
+    LeaseReleaseRequest,
+    LeaseSweepReport,
     TaskNode,
+    TaskAttempt,
     ToolCallRecord,
+    ToolExecutionResult,
+    WorkerEventBatch,
+    WorkerLease,
+    WorkerHeartbeatRequest,
+    WorkerPollRequest,
+    WorkerPollResponse,
     WorkflowTemplateVersion,
 )
 from ..utils import new_id, utc_now
 from ..workers.service import WorkerService
 from .models import ModelRegistry
 from ..orchestrator.service import OrchestratorService
+from .execution_plane import LeaseManager, LocalWorkerAdapter, RunCoordinator
 
 
 class RuntimeService:
@@ -44,7 +60,8 @@ class RuntimeService:
 
     def __init__(
         self,
-        database: HarnessLabDatabase,
+        database: PlatformStore,
+        dispatch_queue: DispatchQueue | InMemoryDispatchQueue,
         context_manager: ContextManager,
         constraint_engine: ConstraintEngine,
         tool_gateway: ToolGateway,
@@ -54,6 +71,7 @@ class RuntimeService:
         worker_service: WorkerService,
     ) -> None:
         self.database = database
+        self.dispatch_queue = dispatch_queue
         self.context_manager = context_manager
         self.constraint_engine = constraint_engine
         self.tool_gateway = tool_gateway
@@ -61,6 +79,13 @@ class RuntimeService:
         self.orchestrator = orchestrator
         self.prompt_assembler = prompt_assembler
         self.worker_service = worker_service
+        self.lease_timeout_seconds = 30
+        self.reclaimed_lease_count = 0
+        self.last_lease_sweep_at: Optional[str] = None
+        self.last_lease_sweep_report = LeaseSweepReport()
+        self.run_coordinator = RunCoordinator(self)
+        self.lease_manager = LeaseManager(self)
+        self.local_worker_adapter = LocalWorkerAdapter(self)
 
     def list_sessions(self, limit: int = 50) -> List[ResearchSession]:
         rows = self.database.fetchall("SELECT payload_json FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,))
@@ -175,6 +200,7 @@ class RuntimeService:
         return ResearchRun(**json.loads(row["payload_json"]))
 
     async def create_run(self, request: RunRequest) -> ResearchRun:
+        self.reclaim_stale_leases()
         session = self.get_session(request.session_id) if request.session_id else self.create_session(
             SessionRequest(
                 goal=request.goal or "Research the current workspace",
@@ -244,15 +270,28 @@ class RuntimeService:
             run_id=run_id,
             session_id=session.session_id,
             status="queued",
+            mission_id=new_id("mission"),
             policy_id=session.active_policy_id,
             workflow_template_id=session.workflow_template_id,
             prompt_frame=prompt_frame,
             execution_trace=trace,
-            result={},
+            result={
+                "context_selection_summary": summary,
+                "final_verdict": final_verdict.model_dump(),
+            },
             created_at=utc_now(),
             updated_at=utc_now(),
         )
+        mission = Mission(
+            mission_id=run.mission_id,
+            session_id=session.session_id,
+            run_id=run.run_id,
+            status="queued",
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+        )
         self._persist_run(run)
+        self.database.upsert_mission(mission)
         self.database.append_event("intent.declared", session.intent_declaration.model_dump(), session_id=session.session_id, run_id=run_id)
         if session.intent_model_call:
             self.database.append_event(
@@ -274,9 +313,21 @@ class RuntimeService:
             session_id=session.session_id,
             run_id=run_id,
         )
-        return await self._execute_task_graph(run, session, context_summary=summary, final_verdict=final_verdict)
+        self.database.append_event(
+            "mission.created",
+            {"mission_id": mission.mission_id, "run_id": run.run_id, "status": mission.status},
+            session_id=session.session_id,
+            run_id=run.run_id,
+        )
+        self.run_coordinator.mark_ready_nodes(session, run.run_id)
+        self._persist_session(session)
+        self._persist_run(run)
+        if session.execution_mode == "single_worker":
+            return await self.local_worker_adapter.drain_run(run.run_id)
+        return self.get_run(run.run_id)
 
     async def resume_run(self, run_id: str) -> ResearchRun:
+        self.reclaim_stale_leases()
         run = self.get_run(run_id)
         if run.status != "awaiting_approval":
             return run
@@ -288,7 +339,7 @@ class RuntimeService:
         if approval.status == "pending":
             return run
         if approval.decision == "deny":
-            self._mark_run_failed(run, session, "approval_denied", "Operator denied the requested high-risk action.")
+            self.run_coordinator.mark_run_failed(run, session, "approval_denied", "Operator denied the requested high-risk action.")
             return self.get_run(run_id)
         if session.task_graph:
             for node in session.task_graph.nodes:
@@ -297,14 +348,23 @@ class RuntimeService:
                     node.metadata["approval_decision"] = approval.decision
         session.status = "running"
         session.updated_at = utc_now()
-        run.status = "running"
+        run.status = "queued"
         if run.execution_trace:
-            run.execution_trace.status = "running"
+            run.execution_trace.status = "queued"
             run.execution_trace.updated_at = utc_now()
         run.updated_at = utc_now()
         self._persist_session(session)
         self._persist_run(run)
-        return await self._execute_task_graph(run, session)
+        mission = self.database.get_mission_by_run(run.run_id)
+        if mission:
+            mission.status = "running"
+            mission.updated_at = utc_now()
+            self.database.upsert_mission(mission)
+        self.run_coordinator.mark_ready_nodes(session, run.run_id)
+        self._persist_session(session)
+        if session.execution_mode == "single_worker":
+            return await self.local_worker_adapter.drain_run(run.run_id)
+        return self.get_run(run.run_id)
 
     async def resolve_approval(self, approval_id: str, decision: str) -> ApprovalRequestModel:
         approval = self.database.resolve_approval(approval_id, decision)
@@ -366,12 +426,74 @@ class RuntimeService:
             raise ValueError("Model profile not found")
         return ModelProfile(**json.loads(row["payload_json"]))
 
-    def list_events(self, session_id: Optional[str] = None, run_id: Optional[str] = None) -> List[EventEnvelope]:
-        return self.database.list_events(session_id=session_id, run_id=run_id, limit=500)
+    def list_events(
+        self,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[EventEnvelope]:
+        return self.database.list_events(session_id=session_id, run_id=run_id, limit=limit)
 
     def get_model_provider_settings(self, model_profile_id: Optional[str] = None) -> ModelProviderSettings:
         profile = self.get_model_profile(model_profile_id or self._default_policy().model_profile_id)
         return self.model_registry.get_provider_settings(profile)
+
+    def get_mission(self, run_id: str) -> Optional[Mission]:
+        return self.database.get_mission_by_run(run_id)
+
+    def list_attempts(self, run_id: Optional[str] = None) -> List[TaskAttempt]:
+        return self.database.list_attempts(run_id=run_id)
+
+    def list_leases(
+        self,
+        run_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[WorkerLease]:
+        return self.lease_manager.list_leases(run_id=run_id, worker_id=worker_id, status=status)
+
+    def get_lease(self, lease_id: str) -> WorkerLease:
+        return self.database.get_lease(lease_id)
+
+    def rebuild_dispatch_state(self) -> None:
+        self.lease_manager.rebuild_dispatch_state()
+
+    def execution_plane_status(self) -> Dict[str, Any]:
+        return self.lease_manager.execution_plane_status()
+
+    def run_coordination_snapshot(self, run_id: str):
+        run = self.get_run(run_id)
+        session = self.get_session(run.session_id)
+        return self.run_coordinator.coordination_snapshot(run, session)
+
+    def run_timeline_summary(self, run_id: str) -> Dict[str, Any]:
+        return self.run_coordinator.timeline_summary(run_id)
+
+    def run_status_summary(self, run_id: str) -> Dict[str, Any]:
+        run = self.get_run(run_id)
+        session = self.get_session(run.session_id)
+        return self.lease_manager.run_status_summary(run, session)
+
+    def get_worker_health_summary(self, worker_id: str):
+        return self.lease_manager.worker_health_summary(worker_id)
+
+    def poll_worker(self, worker_id: str, request: Optional[WorkerPollRequest] = None) -> WorkerPollResponse:
+        return self.lease_manager.poll_worker(worker_id, request)
+
+    def heartbeat_lease(self, lease_id: str, request: WorkerHeartbeatRequest) -> WorkerLease:
+        return self.lease_manager.heartbeat_lease(lease_id, request)
+
+    def submit_worker_events(self, lease_id: str, batch: WorkerEventBatch) -> WorkerLease:
+        return self.lease_manager.submit_worker_events(lease_id, batch)
+
+    async def complete_lease(self, lease_id: str, request: LeaseCompletionRequest) -> ResearchRun:
+        return await self.lease_manager.complete_lease(lease_id, request)
+
+    async def fail_lease(self, lease_id: str, request: LeaseFailureRequest) -> ResearchRun:
+        return await self.lease_manager.fail_lease(lease_id, request)
+
+    async def release_lease(self, lease_id: str, request: LeaseReleaseRequest) -> ResearchRun:
+        return await self.lease_manager.release_lease(lease_id, request)
 
     def _resolve_session_refs(
         self,
@@ -448,6 +570,119 @@ class RuntimeService:
             context=context,
             created_at=utc_now(),
             updated_at=utc_now(),
+        )
+
+    def reclaim_stale_leases(self) -> LeaseSweepReport:
+        return self.lease_manager.reclaim_stale_leases()
+
+    async def _drain_run_with_local_workers(self, run_id: str) -> ResearchRun:
+        return await self.local_worker_adapter.drain_run(run_id)
+
+    async def execute_leased_task(self, lease_id: str) -> ResearchRun:
+        return await self.local_worker_adapter.execute_leased_task(lease_id)
+
+    def _next_dispatch_for_worker(self, worker) -> Optional[DispatchEnvelope]:
+        return self.lease_manager.next_dispatch_for_worker(worker)
+
+    def _create_dispatch(self, run: ResearchRun, session: ResearchSession, node: TaskNode, worker_id: str) -> DispatchEnvelope:
+        return self.lease_manager.create_dispatch(run, session, node, worker_id)
+
+    async def _after_lease_transition(self, run: ResearchRun, session: ResearchSession, node: TaskNode) -> ResearchRun:
+        return await self.run_coordinator.after_lease_transition(run, session, node)
+
+    def _apply_worker_batch(self, run: ResearchRun, batch: WorkerEventBatch, session: Optional[ResearchSession] = None) -> None:
+        session = session or self.get_session(run.session_id)
+        for event in batch.events:
+            self.database.append_event(
+                event.event_type,
+                event.payload,
+                session_id=session.session_id,
+                run_id=run.run_id,
+            )
+        if run.execution_trace:
+            run.execution_trace.model_calls.extend(batch.model_calls)
+            run.execution_trace.tool_calls.extend(batch.tool_calls)
+            run.execution_trace.recovery_events.extend(batch.recovery_events)
+            run.execution_trace.artifacts.extend(batch.artifacts)
+            run.execution_trace.updated_at = utc_now()
+        for artifact in batch.artifacts:
+            self.database.record_artifact_ref(artifact)
+
+    def _mark_ready_nodes(self, session: ResearchSession, run_id: str) -> bool:
+        return self.run_coordinator.mark_ready_nodes(session, run_id)
+
+    def _worker_matches_node(self, worker, session: ResearchSession, node: TaskNode) -> bool:
+        if not worker.capabilities:
+            return True
+        required = None
+        if node.kind == "execution":
+            required = session.intent_declaration.suggested_action.tool_name
+        return required is None or required in worker.capabilities
+
+    def _approval_token_for_run(self, run_id: str) -> Optional[str]:
+        approvals = self.database.list_approvals(run_id=run_id)
+        for approval in approvals:
+            if approval.status == "approved":
+                return f"approval:{approval.approval_id}:{approval.decision}"
+        return None
+
+    def _lease_expiry(self) -> str:
+        return (datetime.now(timezone.utc) + timedelta(seconds=self.lease_timeout_seconds)).isoformat()
+
+    @staticmethod
+    def _utc_datetime(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    def _release_worker_assignment(self, worker_id: str, error: Optional[str] = None) -> None:
+        worker = self.worker_service.get_worker(worker_id)
+        worker.state = "unhealthy" if error else "idle"
+        worker.current_run_id = None
+        worker.current_task_node_id = None
+        worker.current_lease_id = None
+        worker.last_error = error
+        worker.heartbeat_at = utc_now()
+        worker.updated_at = worker.heartbeat_at
+        self.worker_service._persist_worker(worker)
+
+    @staticmethod
+    def _task_node_by_id(task_graph, node_id: str) -> TaskNode:
+        if not task_graph:
+            raise ValueError("Task graph is missing")
+        for node in task_graph.nodes:
+            if node.node_id == node_id:
+                return node
+        raise ValueError(f"Task node not found: {node_id}")
+
+    @staticmethod
+    def _artifact_ref(run: ResearchRun, artifact_type: str) -> Optional[str]:
+        if not run.execution_trace:
+            return None
+        for artifact in run.execution_trace.artifacts:
+            if artifact.artifact_type == artifact_type:
+                return artifact.relative_path
+        return None
+
+    def _stored_final_verdict(self, run: ResearchRun) -> PolicyVerdict:
+        stored = run.result.get("final_verdict")
+        if isinstance(stored, dict) and stored:
+            return PolicyVerdict(**stored)
+        if run.execution_trace:
+            return self.constraint_engine.final_verdict(run.execution_trace.policy_verdicts)
+        raise ValueError("Run does not have a final policy verdict")
+
+    def _tool_risk_level(self, tool_name: str) -> str:
+        for tool in self.tool_gateway.list_tools():
+            if tool.name == tool_name:
+                return tool.risk_level
+        return "unknown"
+
+    @staticmethod
+    def _new_recovery_event(kind: str, summary: str) -> RecoveryEvent:
+        return RecoveryEvent(
+            recovery_id=new_id("recovery"),
+            kind=kind,
+            summary=summary,
+            created_at=utc_now(),
         )
 
     async def _execute_task_graph(
@@ -870,6 +1105,24 @@ class RuntimeService:
         return {"status": "completed"}
 
     async def _execute_action(self, run: ResearchRun, session: ResearchSession):
+        if self._action_requires_approval_token(session.intent_declaration.suggested_action) and not self._approval_token_for_run(run.run_id):
+            result = ToolExecutionResult(ok=False, error="Mutating action is missing an approval token.")
+            call = ToolCallRecord(
+                tool_name=session.intent_declaration.suggested_action.tool_name,
+                payload=session.intent_declaration.suggested_action.payload,
+                ok=result.ok,
+                output=result.output,
+                error=result.error,
+                created_at=utc_now(),
+            )
+            run.execution_trace.tool_calls.append(call)
+            self.database.append_event(
+                "tool.executed",
+                {"tool_name": call.tool_name, "ok": call.ok, "error": call.error},
+                session_id=session.session_id,
+                run_id=run.run_id,
+            )
+            return result
         if session.intent_declaration.suggested_action.tool_name == "model_reflection":
             model_profile = self.get_model_profile(session.model_profile_id)
             reflection, model_call = self.model_registry.reflect_with_trace(
@@ -905,14 +1158,27 @@ class RuntimeService:
         return result
 
     @staticmethod
+    def _action_requires_approval_token(action) -> bool:
+        if action.tool_name == "shell":
+            return True
+        if action.tool_name == "filesystem" and action.payload.get("action") == "write_file":
+            return True
+        return False
+
+    @staticmethod
     def _task_graph(session: ResearchSession):
         if not session.task_graph:
             raise ValueError("Session has no task graph")
         return session.task_graph
 
     def _mark_run_failed(self, run: ResearchRun, session: ResearchSession, kind: str, reason: str) -> None:
+        self.run_coordinator.mark_run_failed(run, session, kind, reason)
+
+    def _mark_run_failed_impl(self, run: ResearchRun, session: ResearchSession, kind: str, reason: str) -> None:
         run.status = "failed"
         run.execution_trace.status = "failed"
+        run.active_lease_id = None
+        run.current_attempt_id = None
         run.execution_trace.recovery_events.append(
             RecoveryEvent(recovery_id=new_id("recovery"), kind=kind, summary=reason, created_at=utc_now())
         )
@@ -931,20 +1197,32 @@ class RuntimeService:
             )
         self._persist_run(run)
         self._persist_session(session)
+        mission = self.database.get_mission_by_run(run.run_id)
+        if mission:
+            mission.status = "failed"
+            mission.updated_at = utc_now()
+            self.database.upsert_mission(mission)
         self.database.append_event("run.failed", {"summary": run.result["summary"], "reason": reason}, session_id=session.session_id, run_id=run.run_id)
-        self._persist_replay(run)
+        self._persist_replay_impl(run)
 
     def _persist_replay(self, run: ResearchRun) -> None:
+        self.run_coordinator.persist_replay(run)
+
+    def _persist_replay_impl(self, run: ResearchRun) -> None:
+        mission = self.get_mission(run.run_id)
         replay_payload = {
             "run": run.model_dump(),
             "session": self.get_session(run.session_id).model_dump(),
+            "mission": mission.model_dump() if mission else None,
             "events": [event.model_dump() for event in self.database.list_events(run_id=run.run_id, limit=500)],
             "approvals": [approval.model_dump() for approval in self.database.list_approvals(run_id=run.run_id)],
             "artifacts": [artifact.model_dump() for artifact in self.database.list_artifacts(run_id=run.run_id)],
+            "attempts": [attempt.model_dump() for attempt in self.database.list_attempts(run_id=run.run_id)],
+            "leases": [lease.model_dump() for lease in self.database.list_leases(run_id=run.run_id)],
         }
         self.database.upsert_replay(run.run_id, run.run_id, replay_payload)
 
-    def _persist_session(self, session: ResearchSession) -> None:
+    def _persist_session(self, session: ResearchSession, conn: Any | None = None) -> None:
         self.database.upsert_row(
             "sessions",
             {
@@ -963,9 +1241,10 @@ class RuntimeService:
                 "updated_at": session.updated_at,
             },
             "session_id",
+            conn=conn,
         )
 
-    def _persist_run(self, run: ResearchRun) -> None:
+    def _persist_run(self, run: ResearchRun, conn: Any | None = None) -> None:
         self.database.upsert_row(
             "runs",
             {
@@ -974,8 +1253,12 @@ class RuntimeService:
                 "status": run.status,
                 "payload_json": json.dumps(run.model_dump(), ensure_ascii=False),
                 "prompt_frame_id": run.prompt_frame.prompt_frame_id if run.prompt_frame else None,
+                "mission_id": run.mission_id,
+                "current_attempt_id": run.current_attempt_id,
+                "active_lease_id": run.active_lease_id,
                 "created_at": run.created_at,
                 "updated_at": run.updated_at,
             },
             "run_id",
+            conn=conn,
         )

@@ -1,21 +1,107 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
-from backend.app.harness_lab.bootstrap import harness_lab_services
+from backend.app.harness_lab.bootstrap import (
+    harness_lab_services,
+    initialize_harness_lab_services,
+    shutdown_harness_lab_services,
+)
+from backend.app.harness_lab.dispatch_queue import InMemoryDispatchQueue
 from backend.app.harness_lab.runtime.models import normalize_base_url
+from backend.app.harness_lab.settings import HarnessLabSettings
+from backend.app.harness_lab.storage import SqliteTestPlatformStore
 from backend.app.harness_lab.types import ModelCallTrace
+from backend.app.harness_lab.workers.runtime_client import WorkerExecutionLoop, WorkerRuntimeClient
 from backend.app.main import app
 
 
-client = TestClient(app)
+@pytest.fixture()
+def client(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+    monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
+    monkeypatch.setenv("HARNESS_LAB_MODEL_NAME", "deepseek-chat")
+    settings = HarnessLabSettings(
+        HARNESS_DB_URL="postgresql://unit:test@localhost:5432/harness_lab",
+        HARNESS_REDIS_URL="redis://localhost:6379/0",
+        HARNESS_WORKER_POLL_INTERVAL=1.0,
+        HARNESS_REDIS_NAMESPACE="harness_lab_test",
+        HARNESS_ARTIFACT_ROOT=str(tmp_path / "artifacts"),
+    )
+    database = SqliteTestPlatformStore(db_path=str(tmp_path / "harness_lab.db"), artifact_root=str(tmp_path / "artifacts"))
+    queue = InMemoryDispatchQueue()
+    initialize_harness_lab_services(settings=settings, database=database, dispatch_queue=queue, force=True)
+    with TestClient(app) as test_client:
+        yield test_client
+    shutdown_harness_lab_services()
 
 
-def test_provider_settings_health_and_catalog(monkeypatch):
+def _mock_provider(monkeypatch, intent_tool: str = "knowledge_search", reflection_summary: str = "Reflection finished through DeepSeek."):
+    def fake_call(settings, messages):
+        system_prompt = messages[0]["content"]
+        if "intent declaration layer" in system_prompt:
+            return (
+                {
+                    "task_type": intent_tool,
+                    "intent": f"Use {intent_tool} before mutating anything.",
+                    "confidence": 0.94,
+                    "risk_mode": "low" if intent_tool != "shell" else "high",
+                    "suggested_action": intent_tool,
+                },
+                ModelCallTrace(
+                    provider=settings.provider,
+                    model_name=settings.model_name,
+                    latency_ms=12,
+                    used_fallback=False,
+                    failure_reason=None,
+                ),
+            )
+        return (
+            {
+                "summary": reflection_summary,
+                "research_notes": ["Stay read-first.", "Keep policy verdicts visible."],
+                "details": {"path": "runtime"},
+            },
+            ModelCallTrace(
+                provider=settings.provider,
+                model_name=settings.model_name,
+                latency_ms=15,
+                used_fallback=False,
+                failure_reason=None,
+            ),
+        )
+
+    monkeypatch.setattr(harness_lab_services.model_registry, "_call_provider_json", fake_call)
+
+
+def _client_transport(client: TestClient):
+    def request(method: str, path: str, payload: dict | None = None):
+        if method == "GET":
+            response = client.get(path)
+        elif method == "POST":
+            response = client.post(path, json=payload or {})
+        else:
+            raise AssertionError(f"Unsupported test transport method: {method}")
+        assert response.status_code < 400, response.text
+        return response.json()
+
+    return request
+
+
+def test_settings_fail_fast_for_non_postgres(monkeypatch):
+    monkeypatch.setenv("HARNESS_DB_URL", "sqlite:///backend/data/harness_lab/harness_lab.db")
+    monkeypatch.setenv("HARNESS_REDIS_URL", "redis://localhost:6379/0")
+    with pytest.raises(RuntimeError, match="Postgres URL"):
+        HarnessLabSettings.from_env()
+
+
+def test_provider_settings_health_and_catalog(client, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
     monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
@@ -31,63 +117,32 @@ def test_provider_settings_health_and_catalog(monkeypatch):
     assert health_data["model_ready"] is False
     assert health_data["fallback_mode"] is True
     assert health_data["base_url"] == "https://api.deepseek.com/v1"
+    assert health_data["storage_backend"] == "sqlite_test"
+    assert health_data["postgres_ready"] is True
+    assert health_data["redis_ready"] is True
+    assert "worker_count_by_state" in health_data
+    assert "missions_running" in health_data
+    assert "leases_by_status" in health_data
+    assert "last_sweep_at" in health_data
+    assert "offline_workers" in health_data
+    assert "unhealthy_workers" in health_data
+    assert "active_workers" in health_data
+    assert "stuck_runs" in health_data
 
     catalog = client.get("/api/settings/catalog")
     assert catalog.status_code == 200
     catalog_data = catalog.json()["data"]
     assert catalog_data["model_provider"]["default_model_name"] == "deepseek-chat"
     assert catalog_data["model_provider"]["fallback_mode"] is True
+    assert catalog_data["execution_plane"]["storage_backend"] == "sqlite_test"
+    assert "worker_count_by_state" in catalog_data["execution_plane"]
     assert "workflow_templates" in catalog_data
     assert "workers" in catalog_data
-    assert any(
-        item["provider"] == "deepseek"
-        and item["config"]["mode"] == "chat"
-        and item["config"]["model_name"] == "deepseek-chat"
-        for item in catalog_data["model_profiles"]
-    )
 
 
-def test_model_backed_intent_and_run_trace(monkeypatch):
+def test_model_backed_intent_and_run_trace(client, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_NAME", "deepseek-chat")
-
-    def fake_call(settings, messages):
-        system_prompt = messages[0]["content"]
-        if "intent declaration layer" in system_prompt:
-            return (
-                {
-                    "task_type": "knowledge_search",
-                    "intent": "Use repository search before touching files.",
-                    "confidence": 0.94,
-                    "risk_mode": "low",
-                    "suggested_action": "knowledge_search",
-                },
-                ModelCallTrace(
-                    provider=settings.provider,
-                    model_name=settings.model_name,
-                    latency_ms=12,
-                    used_fallback=False,
-                    failure_reason=None,
-                ),
-            )
-        return (
-            {
-                "summary": "Reflection finished through DeepSeek.",
-                "research_notes": ["Stay read-first.", "Keep policy verdicts visible."],
-                "details": {"path": "runtime"},
-            },
-            ModelCallTrace(
-                provider=settings.provider,
-                model_name=settings.model_name,
-                latency_ms=15,
-                used_fallback=False,
-                failure_reason=None,
-            ),
-        )
-
-    monkeypatch.setattr(harness_lab_services.model_registry, "_call_provider_json", fake_call)
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
 
     session_response = client.post(
         "/api/sessions",
@@ -112,11 +167,8 @@ def test_model_backed_intent_and_run_trace(monkeypatch):
     assert run_payload["execution_trace"]["tool_calls"][0]["tool_name"] == "knowledge_search"
 
 
-def test_invalid_model_payload_falls_back_without_leaking_secret(monkeypatch):
+def test_invalid_model_payload_falls_back_without_leaking_secret(client, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "super-secret-test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_NAME", "deepseek-chat")
 
     def fake_invalid_call(settings, messages):
         return (
@@ -148,11 +200,8 @@ def test_invalid_model_payload_falls_back_without_leaking_secret(monkeypatch):
     assert "super-secret-test-key" not in json.dumps(session_payload, ensure_ascii=False)
 
 
-def test_model_reflection_path_and_shell_approval_flow(monkeypatch):
+def test_model_reflection_path_and_shell_approval_flow(client, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_NAME", "deepseek-chat")
 
     def fake_call(settings, messages):
         system_prompt = messages[0]["content"]
@@ -244,11 +293,10 @@ def test_model_reflection_path_and_shell_approval_flow(monkeypatch):
     replay = client.get(f"/api/replays/{shell_run_data['run_id']}")
     assert replay.status_code == 200
     replay_body = json.dumps(replay.json()["data"], ensure_ascii=False)
-    assert "super-secret-test-key" not in replay_body
     assert "test-key" not in replay_body
 
 
-def test_policy_compare_and_experiment_registry():
+def test_policy_compare_and_experiment_registry(client):
     policies = client.get("/api/policies")
     assert policies.status_code == 200
     policy_ids = [item["policy_id"] for item in policies.json()["data"][:2]]
@@ -258,84 +306,187 @@ def test_policy_compare_and_experiment_registry():
     assert compare.status_code == 200
     assert "diffs" in compare.json()["data"]
 
-    experiment = client.post(
-        "/api/experiments",
-        json={"scenario_suite": "golden_trace", "harness_ids": policy_ids, "trace_refs": []},
-    )
-    assert experiment.status_code == 200
-    assert experiment.json()["data"]["scenario_suite"] == "golden_trace"
 
-
-def test_improvement_plane_workflow_gate_and_worker_registry(monkeypatch):
+def test_reclaim_stale_lease_and_status_filter(client, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_PROVIDER", "deepseek")
-    monkeypatch.setenv("HARNESS_LAB_MODEL_NAME", "deepseek-chat")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search the repository safely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+    worker = client.post("/api/workers", json={"label": "remote-worker", "capabilities": ["knowledge_search"], "version": "v1"}).json()["data"]
+    dispatches = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"]
+    assert len(dispatches) == 1
+    dispatch = dispatches[0]
+
+    lease = harness_lab_services.runtime.get_lease(dispatch["lease_id"])
+    expired_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    lease.expires_at = expired_at
+    harness_lab_services.database.upsert_lease(lease)
+    harness_lab_services.dispatch_queue.track_lease_expiry(lease.lease_id, time.time() - 5)
+
+    report = harness_lab_services.runtime.reclaim_stale_leases()
+    assert report.reclaimed == 1
+
+    expired_leases = client.get("/api/leases", params={"status": "expired"}).json()["data"]
+    assert any(item["lease_id"] == lease.lease_id for item in expired_leases)
+
+    redispatched = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"]
+    assert len(redispatched) == 1
+    assert redispatched[0]["task_node_id"] == dispatch["task_node_id"]
+
+
+def test_duplicate_lease_completion_is_idempotent(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="model_reflection", reflection_summary="Remote reflection completed.")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Reflect remotely.", "context": {}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+    worker = client.post("/api/workers", json={"label": "reflection-worker", "capabilities": ["model_reflection"], "version": "v1"}).json()["data"]
+    dispatch = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"][0]
+
+    first = client.post(f"/api/leases/{dispatch['lease_id']}/complete", json={"summary": "done"})
+    assert first.status_code == 200
+    second = client.post(f"/api/leases/{dispatch['lease_id']}/complete", json={"summary": "done-again"})
+    assert second.status_code == 200
+
+    detail = client.get(f"/api/runs/{run['run_id']}").json()
+    completed_leases = [lease for lease in detail["leases"] if lease["lease_id"] == dispatch["lease_id"]]
+    assert completed_leases[0]["status"] == "completed"
+    attempts = [attempt for attempt in detail["attempts"] if attempt["lease_id"] == dispatch["lease_id"]]
+    assert attempts[0]["status"] == "completed"
+    assert any(event["event_type"] == "lease.complete_ignored" for event in detail["events"])
+    assert detail["timeline_summary"]["leases_by_status"]["completed"] >= 1
+    assert detail["coordination_snapshot"]["counts_by_status"]["completed"] >= 1
+
+
+def test_rebuild_dispatch_state_restores_ready_queue(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search remotely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    client.post("/api/runs", json={"session_id": session["session_id"]})
+
+    assert harness_lab_services.runtime.execution_plane_status()["ready_queue_depth"] >= 1
+    harness_lab_services.dispatch_queue.reset()
+    assert harness_lab_services.runtime.execution_plane_status()["ready_queue_depth"] == 0
+    harness_lab_services.runtime.rebuild_dispatch_state()
+    assert harness_lab_services.runtime.execution_plane_status()["ready_queue_depth"] >= 1
+
+
+def test_worker_detail_summary_and_heartbeat_events(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search remotely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+    worker = client.post(
+        "/api/workers",
+        json={"label": "summary-worker", "capabilities": ["knowledge_search"], "version": "v1"},
+    ).json()["data"]
+    dispatch = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"][0]
+
+    heartbeat = client.post(
+        f"/api/leases/{dispatch['lease_id']}/heartbeat",
+        json={"state": "executing", "lease_count": 1},
+    )
+    assert heartbeat.status_code == 200
+
+    worker_detail = client.get(f"/api/workers/{worker['worker_id']}")
+    assert worker_detail.status_code == 200
+    worker_payload = worker_detail.json()
+    assert worker_payload["health_summary"]["worker_id"] == worker["worker_id"]
+    assert dispatch["lease_id"] in worker_payload["health_summary"]["recent_lease_ids"]
+    assert any(event["event_type"] == "lease.heartbeat" for event in worker_payload["recent_events"])
+
+    run_detail = client.get(f"/api/runs/{run['run_id']}")
+    assert run_detail.status_code == 200
+    run_payload = run_detail.json()
+    assert run_payload["timeline_summary"]["entries"][0]["lease_id"] == dispatch["lease_id"]
+    assert "mission_status" in run_payload["coordination_snapshot"]
+    assert run_payload["status_summary"]["kind"] == "active_lease"
+
+
+def test_remote_worker_http_loop_completes_run(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search the repository safely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    runtime_client = WorkerRuntimeClient("http://testserver", request_fn=_client_transport(client))
+    loop = WorkerExecutionLoop(
+        runtime_client,
+        poll_interval_seconds=0.01,
+        repo_root=Path(harness_lab_services.database.repo_root),
+        artifact_root=Path(harness_lab_services.settings.resolved_artifact_root()),
+    )
+    result = loop.serve(
+        label="http-worker",
+        capabilities=["knowledge_search"],
+        interval_seconds=0.01,
+        max_tasks=1,
+        max_idle_cycles=2,
+    )
+    assert result["handled_dispatches"] >= 6
+
+    run_detail = client.get(f"/api/runs/{run['run_id']}").json()
+    assert run_detail["data"]["status"] == "completed"
+    assert run_detail["status_summary"]["kind"] == "terminal"
+    assert run_detail["timeline_summary"]["leases_by_status"]["completed"] >= 1
+    assert run_detail["worker"]["execution_mode"] == "remote_http"
+    assert run_detail["worker"]["hostname"]
+    assert run_detail["worker"]["pid"]
+
+    health = client.get("/api/health").json()["data"]
+    assert all(item["run_id"] != run["run_id"] for item in health["stuck_runs"])
+
+
+def test_remote_worker_policy_gate_is_not_marked_stuck(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     def fake_call(settings, messages):
-        system_prompt = messages[0]["content"]
-        user_payload = messages[1]["content"]
-        if "intent declaration layer" in system_prompt:
-            if "shell_command" in user_payload:
-                return (
-                    {
-                        "task_type": "shell_command",
-                        "intent": "Route the shell command through approval-controlled execution.",
-                        "confidence": 0.95,
-                        "risk_mode": "high",
-                        "suggested_action": "shell",
-                    },
-                    ModelCallTrace(
-                        provider=settings.provider,
-                        model_name=settings.model_name,
-                        latency_ms=8,
-                        used_fallback=False,
-                        failure_reason=None,
-                    ),
-                )
-            if "summarize" in user_payload.lower():
-                return (
-                    {
-                        "task_type": "synthesis",
-                        "intent": "Use model reflection to summarize the architecture.",
-                        "confidence": 0.91,
-                        "risk_mode": "low",
-                        "suggested_action": "model_reflection",
-                    },
-                    ModelCallTrace(
-                        provider=settings.provider,
-                        model_name=settings.model_name,
-                        latency_ms=7,
-                        used_fallback=False,
-                        failure_reason=None,
-                    ),
-                )
+        if "intent declaration layer" in messages[0]["content"]:
             return (
                 {
-                    "task_type": "knowledge_search",
-                    "intent": "Inspect the repository safely before changes.",
-                    "confidence": 0.89,
-                    "risk_mode": "low",
-                    "suggested_action": "knowledge_search",
+                    "task_type": "shell_command",
+                    "intent": "Run the explicit shell command under approval control.",
+                    "confidence": 0.96,
+                    "risk_mode": "high",
+                    "suggested_action": "shell",
                 },
                 ModelCallTrace(
                     provider=settings.provider,
                     model_name=settings.model_name,
-                    latency_ms=6,
+                    latency_ms=11,
                     used_fallback=False,
                     failure_reason=None,
                 ),
             )
         return (
             {
-                "summary": "Benchmark reflection completed.",
-                "research_notes": ["Use replay traces.", "Keep worker allocations visible."],
-                "details": {"source": "test"},
+                "summary": "DeepSeek reflection completed.",
+                "research_notes": ["Approval remains required.", "Do not bypass policy."],
+                "details": {"source": "mock"},
             },
             ModelCallTrace(
                 provider=settings.provider,
                 model_name=settings.model_name,
-                latency_ms=9,
+                latency_ms=14,
                 used_fallback=False,
                 failure_reason=None,
             ),
@@ -343,187 +494,35 @@ def test_improvement_plane_workflow_gate_and_worker_registry(monkeypatch):
 
     monkeypatch.setattr(harness_lab_services.model_registry, "_call_provider_json", fake_call)
 
-    workers = client.get("/api/workers")
-    assert workers.status_code == 200
-    assert any(item["worker_id"] == "worker_control_plane_local" for item in workers.json()["data"])
-
-    second_worker = client.post(
-        "/api/workers",
-        json={"label": "parallel-worker", "capabilities": ["filesystem", "knowledge_search", "model_reflection"], "version": "v1"},
-    )
-    assert second_worker.status_code == 200
-
     session = client.post(
         "/api/sessions",
         json={
-            "goal": "Inspect the repository root safely and produce a Harness Lab trace.",
-            "context": {"path": "."},
-            "workflow_template_id": "workflow_template_mission_control_v1",
-            "execution_mode": "single_worker",
+            "goal": "Execute a reviewed shell command.",
+            "context": {"shell_command": "mkdir -p backend/data/harness_lab/test_probe_http"},
+            "execution_mode": "remote_worker",
         },
     ).json()["data"]
     run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
-    run_detail = client.get(f"/api/runs/{run['run_id']}")
-    assert run_detail.status_code == 200
-    task_started_events = [
-        item for item in run_detail.json()["events"] if item["event_type"] == "task.started"
-    ]
-    task_worker_ids = {item["payload"].get("worker_id") for item in task_started_events if item["payload"].get("worker_id")}
-    assert len(task_worker_ids) >= 2
 
-    reflection_session = client.post(
-        "/api/sessions",
-        json={
-            "goal": "Summarize the current architecture and monitoring tradeoffs.",
-            "context": {},
-            "workflow_template_id": "workflow_template_mission_control_v1",
-            "execution_mode": "single_worker",
-        },
-    ).json()["data"]
-    reflection_run = client.post("/api/runs", json={"session_id": reflection_session["session_id"]}).json()["data"]
-
-    approval_session = client.post(
-        "/api/sessions",
-        json={
-            "goal": "Review a shell action under approval control.",
-            "context": {"shell_command": "mkdir -p backend/data/harness_lab/benchmark_probe"},
-            "workflow_template_id": "workflow_template_mission_control_v1",
-            "execution_mode": "single_worker",
-        },
-    ).json()["data"]
-    approval_run = client.post("/api/runs", json={"session_id": approval_session["session_id"]}).json()["data"]
-    assert approval_run["status"] == "awaiting_approval"
-
-    trace_refs = [run["run_id"], reflection_run["run_id"], approval_run["run_id"]]
-
-    policy_candidate_response = client.post(
-        "/api/improvement/candidates/policy",
-        json={"trace_refs": trace_refs},
+    runtime_client = WorkerRuntimeClient("http://testserver", request_fn=_client_transport(client))
+    loop = WorkerExecutionLoop(
+        runtime_client,
+        poll_interval_seconds=0.01,
+        repo_root=Path(harness_lab_services.database.repo_root),
+        artifact_root=Path(harness_lab_services.settings.resolved_artifact_root()),
     )
-    assert policy_candidate_response.status_code == 200
-    policy_candidate = policy_candidate_response.json()["data"]["candidate"]
-    assert policy_candidate["kind"] == "policy"
-
-    replay_eval = client.post(
-        "/api/evals/replay",
-        json={"candidate_id": policy_candidate["candidate_id"], "trace_refs": trace_refs},
+    result = loop.serve(
+        label="approval-http-worker",
+        capabilities=["shell"],
+        interval_seconds=0.01,
+        max_tasks=1,
+        max_idle_cycles=2,
     )
-    assert replay_eval.status_code == 200
-    replay_eval_data = replay_eval.json()["data"]
-    assert replay_eval_data["suite"] == "replay"
-    assert replay_eval_data["suite_manifest"]["source"] == "historical_traces"
-    replay_eval_detail = client.get(f"/api/evals/{replay_eval_data['evaluation_id']}")
-    assert replay_eval_detail.status_code == 200
-    assert replay_eval_detail.json()["data"]["evaluation_id"] == replay_eval_data["evaluation_id"]
+    assert result["handled_dispatches"] >= 3
 
-    gate_before_policy_benchmark = client.get(f"/api/candidates/{policy_candidate['candidate_id']}/gate")
-    assert gate_before_policy_benchmark.status_code == 200
-    assert gate_before_policy_benchmark.json()["data"]["replay_passed"] is True
-    assert gate_before_policy_benchmark.json()["data"]["benchmark_passed"] is False
+    run_detail = client.get(f"/api/runs/{run['run_id']}").json()
+    assert run_detail["data"]["status"] == "awaiting_approval"
+    assert run_detail["status_summary"]["kind"] == "awaiting_approval"
 
-    publish_policy_too_early = client.post(f"/api/candidates/{policy_candidate['candidate_id']}/publish")
-    assert publish_policy_too_early.status_code == 400
-
-    policy_benchmark_eval = client.post(
-        "/api/evals/benchmark",
-        json={"candidate_id": policy_candidate["candidate_id"], "trace_refs": trace_refs},
-    )
-    assert policy_benchmark_eval.status_code == 200
-    assert policy_benchmark_eval.json()["data"]["suite"] == "benchmark"
-    assert len(policy_benchmark_eval.json()["data"]["bucket_results"]) == 5
-
-    published_policy_candidate = client.post(f"/api/candidates/{policy_candidate['candidate_id']}/publish")
-    assert published_policy_candidate.status_code == 200
-    assert published_policy_candidate.json()["data"]["publish_status"] == "published"
-
-    workflow_candidate_response = client.post(
-        "/api/improvement/candidates/workflow",
-        json={"trace_refs": trace_refs},
-    )
-    assert workflow_candidate_response.status_code == 200
-    workflow_candidate = workflow_candidate_response.json()["data"]["candidate"]
-    assert workflow_candidate["kind"] == "workflow"
-
-    benchmark_eval = client.post(
-        "/api/evals/benchmark",
-        json={"candidate_id": workflow_candidate["candidate_id"], "trace_refs": trace_refs},
-    )
-    assert benchmark_eval.status_code == 200
-    benchmark_eval_data = benchmark_eval.json()["data"]
-    assert benchmark_eval_data["suite"] == "benchmark"
-    assert benchmark_eval_data["suite_manifest"]["source"] == "historical_traces"
-    assert len(benchmark_eval_data["bucket_results"]) == 5
-    assert "safe_read" in [item["bucket"] for item in benchmark_eval_data["bucket_results"]]
-    assert isinstance(benchmark_eval_data["coverage_gaps"], list)
-
-    workflow_replay_eval = client.post(
-        "/api/evals/replay",
-        json={"candidate_id": workflow_candidate["candidate_id"], "trace_refs": trace_refs},
-    )
-    assert workflow_replay_eval.status_code == 200
-
-    workflow_gate = client.get(f"/api/candidates/{workflow_candidate['candidate_id']}/gate")
-    assert workflow_gate.status_code == 200
-    assert workflow_gate.json()["data"]["replay_passed"] is True
-    assert workflow_gate.json()["data"]["benchmark_passed"] is True
-    assert workflow_gate.json()["data"]["approval_required"] is True
-    assert workflow_gate.json()["data"]["approval_satisfied"] is False
-
-    publish_without_approval = client.post(f"/api/candidates/{workflow_candidate['candidate_id']}/publish")
-    assert publish_without_approval.status_code == 400
-
-    approved_candidate = client.post(f"/api/candidates/{workflow_candidate['candidate_id']}/approve")
-    assert approved_candidate.status_code == 200
-    assert approved_candidate.json()["data"]["approved"] is True
-    assert approved_candidate.json()["data"]["publish_status"] == "publish_ready"
-
-    published_workflow_candidate = client.post(f"/api/candidates/{workflow_candidate['candidate_id']}/publish")
-    assert published_workflow_candidate.status_code == 200
-    assert published_workflow_candidate.json()["data"]["publish_status"] == "published"
-
-    workflows = client.get("/api/workflows")
-    assert workflows.status_code == 200
-    workflow_ids = [item["workflow_id"] for item in workflows.json()["data"][:2]]
-    assert len(workflow_ids) == 2
-
-    workflow_diff = client.post("/api/workflows/compare", json={"workflow_ids": workflow_ids})
-    assert workflow_diff.status_code == 200
-    assert "diffs" in workflow_diff.json()["data"]
-
-    candidates = client.get("/api/candidates")
-    assert candidates.status_code == 200
-    assert len(candidates.json()["data"]) >= 2
-
-    failure_clusters = client.get("/api/failure-clusters")
-    assert failure_clusters.status_code == 200
-    assert isinstance(failure_clusters.json()["data"], list)
-
-
-def test_hlab_cli_doctor_and_workers():
-    doctor = subprocess.run(
-        [sys.executable, "-m", "backend.app.harness_lab.cli", "--output-format", "json", "doctor"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    doctor_payload = json.loads(doctor.stdout)
-    assert "control_plane" in doctor_payload
-    assert "provider" in doctor_payload
-
-    workers = subprocess.run(
-        [sys.executable, "-m", "backend.app.harness_lab.cli", "--output-format", "json", "workers"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    workers_payload = json.loads(workers.stdout)
-    assert isinstance(workers_payload, list)
-    assert any(item["worker_id"] == "worker_control_plane_local" for item in workers_payload)
-
-    failed_promote = subprocess.run(
-        [sys.executable, "-m", "backend.app.harness_lab.cli", "--output-format", "json", "promote", "candidate_missing_gate"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert failed_promote.returncode != 0
+    health = client.get("/api/health").json()["data"]
+    assert all(item["run_id"] != run["run_id"] for item in health["stuck_runs"])

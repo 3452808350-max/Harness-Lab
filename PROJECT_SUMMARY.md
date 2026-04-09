@@ -1,26 +1,31 @@
 # Harness Lab Summary
 
-This repository now targets a research-first Harness Lab instead of the earlier workflow-centric app or the interim prototype.
+This repository now targets a research-first Harness Lab with an emerging remote worker execution plane.
 
 ## Primary architecture
 
 - `backend/app/harness_lab/context`: layered context assembly
-- `backend/app/harness_lab/constraints`: natural-language guardrails and verdicts
-- `backend/app/harness_lab/boundary`: tool gateway and patch staging
-- `backend/app/harness_lab/orchestrator`: task graph construction
-- `backend/app/harness_lab/prompting`: structured prompt frames
-- `backend/app/harness_lab/runtime`: session/run/replay lifecycle
-- `backend/app/harness_lab/optimizer`: policy compare and experiments
-- `frontend/src/lab`: Harness Lab workbench
+- `backend/app/harness_lab/constraints`: natural-language guardrails and deny-before-allow verdicts
+- `backend/app/harness_lab/boundary`: tool gateway, patch staging, and artifact capture
+- `backend/app/harness_lab/orchestrator`: task graph construction and wave-ready scheduling
+- `backend/app/harness_lab/runtime`: session, run, mission, task attempt, and worker lease lifecycle
+- `backend/app/harness_lab/improvement`: policy/workflow candidates, replay/benchmark evaluation, publish gate
+- `frontend/src/lab`: mission-control workbench
 
 ## Primary user experience
 
 - create a research session from a natural-language goal
-- inspect context blocks, prompt frames, and task graph
-- run the session under policy preflight
-- approve or deny risky actions
-- inspect replays, compare harness policies, and record experiments
+- inspect intent, context blocks, prompt frames, and task graph
+- execute the session through a lease-driven worker path
+- resolve approvals for risky actions
+- inspect replays, attempts, leases, policies, and evaluations
 
 ## Repository status
 
-The active repository surface is now the Harness Lab core and workbench.
+The active repository surface is the Harness Lab core, mission-control web UI, CLI operator surface, and legacy archive.
+
+## Important design drift
+
+- The model layer is no longer heuristic-only: intent and reflection already use a provider-backed path with fallback.
+- The execution layer is no longer purely single-worker: runs now materialize mission / attempt / lease entities and can be driven by worker polling.
+- The storage layer has been cut over at the architecture level to Postgres + Redis with fail-fast startup, and the current implementation has now been smoke-tested against real Docker-backed Postgres/Redis. SQLite remains only as a test-only injected store for local regression coverage.
