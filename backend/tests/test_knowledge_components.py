@@ -41,11 +41,17 @@ class FakeKnowledgeDatabase:
                 artifact_id=f"artifact_{len(self._artifacts) + 1}",
                 run_id="run_unit",
                 artifact_type=artifact_type,
+                storage_backend="local",
+                storage_key=relative_path,
                 relative_path=relative_path,
                 metadata={},
                 created_at=utc_now(),
             )
         )
+
+    def read_artifact_text(self, artifact_id: str) -> str:
+        artifact = next(item for item in self._artifacts if item.artifact_id == artifact_id)
+        return (self.artifact_root / artifact.relative_path).read_text(encoding="utf-8")
 
 
 class FakeEncoder:

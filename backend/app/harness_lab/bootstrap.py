@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from .artifact_store import create_artifact_store
 from .boundary.gateway import ToolGateway
 from .boundary.sandbox import SandboxManager
 from .constraints.engine import ConstraintEngine
@@ -349,6 +350,7 @@ class HarnessLabServices:
         self.runtime.reclaim_stale_leases()
         provider = self.runtime.get_model_provider_settings().model_dump()
         knowledge = self.knowledge.status().model_dump()
+        artifacts = self.database.artifact_status().model_dump()
         sandbox = self.sandbox.status().model_dump()
         workers = self.workers.list_workers()
         candidates = self.improvement.list_candidates()
@@ -379,6 +381,8 @@ class HarnessLabServices:
             warnings.append("Knowledge index has not been built yet; retrieval will use live fallback search.")
         elif knowledge["fallback_mode"]:
             warnings.append("Knowledge index is running in fallback mode; semantic retrieval is unavailable.")
+        if not artifacts["ready"]:
+            warnings.append(f"Artifact backend is not ready: {artifacts['backend']}.")
         published_workflows = [item for item in self.improvement.list_workflows() if item.status == "published"]
         if not published_workflows:
             warnings.append("No published workflow template is available.")
@@ -391,6 +395,7 @@ class HarnessLabServices:
             },
             "provider": provider,
             "knowledge": knowledge,
+            "artifacts": artifacts,
             "sandbox": sandbox,
             "workers": {
                 "count": len(workers),
@@ -412,6 +417,7 @@ class HarnessLabServices:
                 provider["model_ready"]
                 and bool(workers)
                 and bool(published_workflows)
+                and artifacts["ready"]
                 and execution["postgres_ready"]
                 and execution["redis_ready"]
                 and sandbox["docker_ready"]
@@ -432,9 +438,14 @@ def create_harness_lab_services(
     dispatch_queue: DispatchQueue | InMemoryDispatchQueue | None = None,
 ) -> HarnessLabServices:
     active_settings = settings or HarnessLabSettings.from_env()
+    artifact_store = create_artifact_store(
+        active_settings,
+        artifact_root_override=active_settings.resolved_artifact_root(),
+    )
     active_database = database or PostgresPlatformStore(
         db_url=active_settings.db_url,
         artifact_root=active_settings.resolved_artifact_root(),
+        artifact_store=artifact_store,
     )
     active_queue = dispatch_queue or DispatchQueue(
         redis_url=active_settings.redis_url,

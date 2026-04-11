@@ -62,6 +62,7 @@ class LeaseManager:
         worker_registry: Any,  # WorkerRegistry
         dispatch_queue: Any,  # DispatchQueue
         orchestrator: Any,  # OrchestratorService
+        dispatcher: Any = None,  # Dispatcher - optional for backward compat during migration
         lease_timeout_seconds: int = 30,
     ) -> None:
         self.database = database
@@ -73,6 +74,7 @@ class LeaseManager:
         self.worker_registry = worker_registry
         self.dispatch_queue = dispatch_queue
         self.orchestrator = orchestrator
+        self.dispatcher = dispatcher
         self.lease_timeout_seconds = lease_timeout_seconds
         self.reclaimed_lease_count = 0
         self.last_lease_sweep_at: Optional[str] = None
@@ -95,6 +97,12 @@ class LeaseManager:
         """Poll for tasks assigned to worker."""
         from ..types import WorkerPollRequest
         request = request or WorkerPollRequest()
+        
+        # Use dispatcher for dispatching if available
+        if self.dispatcher is not None:
+            return self._poll_with_dispatcher(worker_id, request)
+        
+        # Fallback to legacy dispatch logic
         self.reclaim_stale_leases()
         
         worker = self.worker_registry.get_worker(worker_id)
@@ -111,6 +119,29 @@ class LeaseManager:
             if candidate is None:
                 break
             dispatches.append(candidate)
+            worker = self.worker_registry.get_worker(worker_id)
+        
+        return WorkerPollResponse(dispatches=dispatches)
+    
+    def _poll_with_dispatcher(self, worker_id: str, request: WorkerPollRequest) -> WorkerPollResponse:
+        """Poll using the dispatcher for task selection."""
+        worker = self.worker_registry.get_worker(worker_id)
+        
+        dispatches: List[DispatchEnvelope] = []
+        max_tasks = max(1, request.max_tasks)
+        
+        for _ in range(max_tasks):
+            dispatch = self.dispatcher.next_dispatch_for_worker(
+                worker=worker,
+                coordination=self.coordination,
+                constraints=self.constraints,
+                context=self.context,
+                reclaim_first=len(dispatches) == 0,  # Only reclaim on first iteration
+            )
+            if dispatch is None:
+                break
+            dispatches.append(dispatch)
+            # Refresh worker state for next iteration
             worker = self.worker_registry.get_worker(worker_id)
         
         return WorkerPollResponse(dispatches=dispatches)

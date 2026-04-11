@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from ..artifact_store import LocalFilesystemArtifactStore
+from ..artifact_store import ArtifactStore, LocalFilesystemArtifactStore, create_artifact_store
 from ..boundary.gateway import ToolGateway
 from ..boundary.sandbox import SandboxManager
 from ..runtime.models import ModelRegistry
@@ -50,11 +50,16 @@ class _NoopConstraints:
 
 
 class LocalArtifactStore:
-    def __init__(self, repo_root: Path, artifact_root: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        artifact_root: Optional[Path] = None,
+        backend: Optional[ArtifactStore] = None,
+    ) -> None:
         self.repo_root = repo_root
         resolved_root = artifact_root or (repo_root / "backend" / "data" / "harness_lab" / "artifacts")
         self.artifact_root = resolved_root
-        self.backend = LocalFilesystemArtifactStore(resolved_root)
+        self.backend = backend or LocalFilesystemArtifactStore(resolved_root)
         self._created: list[ArtifactRef] = []
 
     def write_artifact_text(
@@ -178,8 +183,12 @@ class WorkerExecutionLoop:
             env_artifact_root = os.getenv("HARNESS_ARTIFACT_ROOT")
             if env_artifact_root:
                 resolved_artifact_root = Path(env_artifact_root)
-        self.artifact_store = LocalArtifactStore(self.repo_root, resolved_artifact_root)
         self.settings = HarnessLabSettings.from_env()
+        artifact_backend = create_artifact_store(
+            self.settings,
+            artifact_root_override=resolved_artifact_root,
+        )
+        self.artifact_store = LocalArtifactStore(self.repo_root, resolved_artifact_root, backend=artifact_backend)
         self.sandbox_manager = SandboxManager(self.settings, self.artifact_store)
         self.tool_gateway = ToolGateway(self.artifact_store, _NoopConstraints(), sandbox_manager=self.sandbox_manager)
         self.model_registry = model_registry or ModelRegistry()

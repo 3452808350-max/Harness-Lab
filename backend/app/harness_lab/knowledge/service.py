@@ -184,19 +184,16 @@ class KnowledgeIndexService:
         for artifact in self.database.list_artifacts():
             if artifact.artifact_type not in {"learning_summary", "recovery_packet"}:
                 continue
-            absolute_path = self.database.artifact_root / artifact.relative_path
-            if not absolute_path.exists():
-                continue
             try:
-                content = absolute_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+                content = self.database.read_artifact_text(artifact.artifact_id)
+            except (UnicodeDecodeError, ValueError, RuntimeError, FileNotFoundError):
                 continue
             documents.append(
                 {
                     "source_type": "artifacts",
                     "source_ref": f"artifact://{artifact.artifact_id}",
-                    "title": artifact.relative_path,
-                    "path": artifact.relative_path,
+                    "title": artifact.relative_path or artifact.storage_key,
+                    "path": artifact.relative_path or artifact.storage_key,
                     "artifact_type": artifact.artifact_type,
                     "content": content,
                     "updated_at": artifact.created_at,

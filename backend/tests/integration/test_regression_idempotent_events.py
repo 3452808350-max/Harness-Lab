@@ -7,9 +7,11 @@ History: Previously execute_control_plane_node was not async, causing coroutine
 warnings and incorrect return values.
 """
 
+import sys
+sys.path.insert(0, '/home/kyj/文档/program/programmer (wokerflow)/backend')
+
 import pytest
 import asyncio
-import sys
 import warnings
 from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone

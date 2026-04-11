@@ -60,6 +60,7 @@ from .execution_plane import LocalWorkerAdapter, RunCoordinator
 from ..fleet import create_protocol_adapters
 from ..fleet.lease_manager import LeaseManager
 from ..fleet.worker_registry import WorkerRegistry
+from ..fleet.dispatcher import Dispatcher, InMemoryDispatcher
 
 
 class RuntimeService:
@@ -93,10 +94,25 @@ class RuntimeService:
         self.run_coordinator = RunCoordinator(self)
         self.local_worker_adapter = LocalWorkerAdapter(self)
         
+        # Create Dispatcher first (owns dispatch queue and matching logic)
+        if hasattr(dispatch_queue, '__class__') and 'InMemory' in dispatch_queue.__class__.__name__:
+            self.dispatcher = InMemoryDispatcher(
+                worker_registry=self.worker_registry,
+                database=database,
+                lease_timeout_seconds=self.lease_timeout_seconds,
+            )
+        else:
+            self.dispatcher = Dispatcher(
+                queue=dispatch_queue,
+                worker_registry=self.worker_registry,
+                database=database,
+                lease_timeout_seconds=self.lease_timeout_seconds,
+            )
+        
         # Create protocol adapters for LeaseManager
         adapters = create_protocol_adapters(self)
         
-        # Initialize LeaseManager with protocol dependencies
+        # Initialize LeaseManager with protocol dependencies and dispatcher
         self.lease_manager = LeaseManager(
             database=database,
             coordination=adapters["coordination"],
@@ -107,6 +123,7 @@ class RuntimeService:
             worker_registry=self.worker_registry,
             dispatch_queue=dispatch_queue,
             orchestrator=orchestrator,
+            dispatcher=self.dispatcher,
             lease_timeout_seconds=self.lease_timeout_seconds,
         )
 
@@ -1026,7 +1043,7 @@ class RuntimeService:
             return None
         for artifact in run.execution_trace.artifacts:
             if artifact.artifact_type == artifact_type:
-                return artifact.relative_path
+                return artifact.storage_key or artifact.relative_path
         return None
 
     def _stored_final_verdict(self, run: ResearchRun) -> PolicyVerdict:

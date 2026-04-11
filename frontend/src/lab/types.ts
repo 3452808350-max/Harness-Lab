@@ -134,9 +134,21 @@ export interface ArtifactRef {
   artifact_id: string
   run_id?: string | null
   artifact_type: string
+  storage_backend: string
+  storage_key: string
   relative_path: string
+  content_type: string
+  size_bytes: number
+  sha256: string
   metadata: Record<string, unknown>
   created_at: string
+}
+
+export interface ArtifactStoreStatus {
+  backend: string
+  ready: boolean
+  bucket_or_root: string
+  last_error?: string | null
 }
 
 export interface ExecutionTrace {
@@ -444,6 +456,11 @@ export interface SettingsCatalog {
   workers?: WorkerSnapshot[]
   tools: Array<Record<string, unknown>>
   model_provider?: Record<string, unknown>
+  artifact_backend?: string
+  artifact_ready?: boolean
+  artifact_bucket_or_root?: string
+  artifact_last_error?: string | null
+  artifact_store?: ArtifactStoreStatus
   execution_plane?: Record<string, unknown>
   sandbox?: Record<string, unknown>
 }

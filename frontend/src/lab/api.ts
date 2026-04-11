@@ -21,6 +21,7 @@ import type {
   SettingsCatalog,
   QueueShardStatus,
   ApprovalRequest,
+  ArtifactRef,
   WorkerLease,
   WorkerSnapshot,
   WorkflowTemplateVersion,
@@ -100,6 +101,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getRun: async (runId: string) => requestRaw<RunDetail>(`/api/runs/${runId}`),
+  getArtifact: async (artifactId: string) => request<ArtifactRef & { locator: string }>(`/api/artifacts/${artifactId}`),
   getReplay: async (replayId: string) => request<ReplayEnvelope>(`/api/replays/${replayId}`),
   listPolicies: async () => request<HarnessPolicy[]>('/api/policies'),
   comparePolicies: async (policyIds: string[]) =>

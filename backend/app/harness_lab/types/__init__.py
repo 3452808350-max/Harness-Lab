@@ -153,6 +153,7 @@ from .tool import (
 from .system import (
     EventEnvelope,
     ArtifactRef,
+    ArtifactStoreStatus,
     DoctorReport,
 )
 
@@ -277,6 +278,7 @@ __all__ = [
     # System
     "EventEnvelope",
     "ArtifactRef",
+    "ArtifactStoreStatus",
     "DoctorReport",
 ]
 

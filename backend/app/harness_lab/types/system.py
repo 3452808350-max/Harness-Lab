@@ -21,9 +21,22 @@ class ArtifactRef(BaseModel):
     artifact_id: str
     run_id: Optional[str] = None
     artifact_type: str
-    relative_path: str
+    storage_backend: str = "local"
+    storage_key: str = ""
+    relative_path: str = ""
+    content_type: str = "text/plain; charset=utf-8"
+    size_bytes: int = 0
+    sha256: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: str
+
+
+class ArtifactStoreStatus(BaseModel):
+    """Status of the configured artifact backend."""
+    backend: str
+    ready: bool
+    bucket_or_root: str
+    last_error: Optional[str] = None
 
 
 class DoctorReport(BaseModel):

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from backend.app.harness_lab.bootstrap import initialize_harness_lab_services, shutdown_harness_lab_services
 from backend.app.harness_lab.control_plane.approvals import router as approvals_router
+from backend.app.harness_lab.control_plane.artifacts import router as artifacts_router
 from backend.app.harness_lab.control_plane.candidates import router as candidates_router
 from backend.app.harness_lab.control_plane.constraints import router as constraints_router
 from backend.app.harness_lab.control_plane.context import router as context_router
@@ -75,6 +76,7 @@ app.add_middleware(
 )
 
 app.include_router(sessions_router)
+app.include_router(artifacts_router)
 app.include_router(intent_router)
 app.include_router(knowledge_router)
 app.include_router(context_router)

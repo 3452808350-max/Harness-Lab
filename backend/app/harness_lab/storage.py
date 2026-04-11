@@ -11,7 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .artifact_store import ArtifactStore, LocalFilesystemArtifactStore
-from .types import ApprovalRequestModel, ArtifactRef, EventEnvelope, Mission, TaskAttempt, WorkerLease
+from .types import ApprovalRequestModel, ArtifactRef, ArtifactStoreStatus, EventEnvelope, Mission, TaskAttempt, WorkerLease
 from .utils import json_dumps, new_id, utc_now
 
 
@@ -498,13 +498,13 @@ class PlatformStore(ABC):
 
     backend_name = "unknown"
 
-    def __init__(self, artifact_root: Optional[str] = None) -> None:
+    def __init__(self, artifact_root: Optional[str] = None, artifact_store: ArtifactStore | None = None) -> None:
         self.repo_root = Path(__file__).resolve().parents[3]
         self.data_dir = self.repo_root / "backend" / "data" / "harness_lab"
         self.artifact_root = Path(artifact_root) if artifact_root else self.data_dir / "artifacts"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
-        self.artifact_store: ArtifactStore = LocalFilesystemArtifactStore(self.artifact_root)
+        self.artifact_store: ArtifactStore = artifact_store or LocalFilesystemArtifactStore(self.artifact_root)
 
     @abstractmethod
     def ping(self) -> None:
@@ -623,6 +623,9 @@ class PlatformStore(ABC):
             for row in rows
         ]
 
+    def artifact_status(self) -> ArtifactStoreStatus:
+        return self.artifact_store.status()
+
     def write_artifact_text(
         self,
         run_id: str,
@@ -630,6 +633,7 @@ class PlatformStore(ABC):
         filename: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        content_type: Optional[str] = None,
     ) -> ArtifactRef:
         artifact = self.artifact_store.write_text(
             run_id=run_id,
@@ -637,39 +641,51 @@ class PlatformStore(ABC):
             filename=filename,
             content=content,
             metadata=metadata,
+            content_type=content_type,
         )
-        self.execute(
-            """
-            INSERT INTO artifacts (artifact_id, run_id, artifact_type, relative_path, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact.artifact_id,
-                artifact.run_id,
-                artifact.artifact_type,
-                artifact.relative_path,
-                json_dumps(artifact.metadata),
-                artifact.created_at,
-            ),
-        )
+        self.record_artifact_ref(artifact)
         return artifact
+
+    def write_artifact_bytes(
+        self,
+        run_id: str,
+        artifact_type: str,
+        filename: str,
+        content: bytes,
+        metadata: Optional[Dict[str, Any]] = None,
+        content_type: Optional[str] = None,
+    ) -> ArtifactRef:
+        artifact = self.artifact_store.write_bytes(
+            run_id=run_id,
+            artifact_type=artifact_type,
+            filename=filename,
+            content=content,
+            metadata=metadata,
+            content_type=content_type,
+        )
+        self.record_artifact_ref(artifact)
+        return artifact
+
+    def get_artifact(self, artifact_id: str, conn: Any | None = None) -> ArtifactRef:
+        row = self.fetchone("SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,), conn=conn)
+        if not row:
+            raise ValueError("Artifact not found")
+        return self._artifact_from_row(row)
 
     def list_artifacts(self, run_id: Optional[str] = None, conn: Any | None = None) -> List[ArtifactRef]:
         if run_id:
             rows = self.fetchall("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at DESC", (run_id,), conn=conn)
         else:
             rows = self.fetchall("SELECT * FROM artifacts ORDER BY created_at DESC", conn=conn)
-        return [
-            ArtifactRef(
-                artifact_id=row["artifact_id"],
-                run_id=row["run_id"],
-                artifact_type=row["artifact_type"],
-                relative_path=row["relative_path"],
-                metadata=json.loads(row["payload_json"]),
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [self._artifact_from_row(row) for row in rows]
+
+    def read_artifact_text(self, artifact_id: str, conn: Any | None = None) -> str:
+        artifact = self.get_artifact(artifact_id, conn=conn)
+        return self.artifact_store.read_text(artifact)
+
+    def read_artifact_bytes(self, artifact_id: str, conn: Any | None = None) -> bytes:
+        artifact = self.get_artifact(artifact_id, conn=conn)
+        return self.artifact_store.read_bytes(artifact)
 
     def record_artifact_ref(self, artifact: ArtifactRef, conn: Any | None = None) -> None:
         self.upsert_row(
@@ -678,12 +694,33 @@ class PlatformStore(ABC):
                 "artifact_id": artifact.artifact_id,
                 "run_id": artifact.run_id,
                 "artifact_type": artifact.artifact_type,
-                "relative_path": artifact.relative_path,
-                "payload_json": json_dumps(artifact.metadata),
+                "relative_path": artifact.relative_path or artifact.storage_key,
+                "payload_json": json_dumps(artifact.model_dump()),
                 "created_at": artifact.created_at,
             },
             "artifact_id",
             conn=conn,
+        )
+
+    def _artifact_from_row(self, row: Dict[str, Any]) -> ArtifactRef:
+        payload = json.loads(row["payload_json"]) if row.get("payload_json") else {}
+        if payload.get("artifact_id"):
+            payload.setdefault("run_id", row["run_id"])
+            payload.setdefault("artifact_type", row["artifact_type"])
+            payload.setdefault("storage_backend", "local")
+            payload.setdefault("storage_key", row["relative_path"])
+            payload.setdefault("relative_path", row["relative_path"])
+            payload.setdefault("created_at", row["created_at"])
+            return ArtifactRef(**payload)
+        return ArtifactRef(
+            artifact_id=row["artifact_id"],
+            run_id=row["run_id"],
+            artifact_type=row["artifact_type"],
+            storage_backend="local",
+            storage_key=row["relative_path"],
+            relative_path=row["relative_path"],
+            metadata=payload,
+            created_at=row["created_at"],
         )
 
     def create_approval(
@@ -927,8 +964,8 @@ class PlatformStore(ABC):
 class BaseSqlPlatformStore(PlatformStore):
     """Shared SQL helpers for production Postgres and test SQLite stores."""
 
-    def __init__(self, artifact_root: Optional[str] = None) -> None:
-        super().__init__(artifact_root=artifact_root)
+    def __init__(self, artifact_root: Optional[str] = None, artifact_store: ArtifactStore | None = None) -> None:
+        super().__init__(artifact_root=artifact_root, artifact_store=artifact_store)
         self._initialize()
 
     def _initialize(self) -> None:
@@ -956,9 +993,9 @@ class BaseSqlPlatformStore(PlatformStore):
 class PostgresPlatformStore(BaseSqlPlatformStore):
     backend_name = "postgresql"
 
-    def __init__(self, db_url: str, artifact_root: Optional[str] = None) -> None:
+    def __init__(self, db_url: str, artifact_root: Optional[str] = None, artifact_store: ArtifactStore | None = None) -> None:
         self.db_url = db_url
-        super().__init__(artifact_root=artifact_root)
+        super().__init__(artifact_root=artifact_root, artifact_store=artifact_store)
 
     @contextmanager
     def connection(self) -> Iterator[psycopg.Connection]:
@@ -1043,9 +1080,14 @@ class SqliteTestPlatformStore(BaseSqlPlatformStore):
 
     backend_name = "sqlite_test"
 
-    def __init__(self, db_path: Optional[str] = None, artifact_root: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        artifact_root: Optional[str] = None,
+        artifact_store: ArtifactStore | None = None,
+    ) -> None:
         self.db_path = Path(db_path) if db_path else (Path(__file__).resolve().parents[3] / "backend" / "data" / "harness_lab" / "test_harness_lab.db")
-        super().__init__(artifact_root=artifact_root)
+        super().__init__(artifact_root=artifact_root, artifact_store=artifact_store)
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

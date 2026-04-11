@@ -12,6 +12,7 @@ async def settings_catalog():
     provider_settings = harness_lab_services.runtime.get_model_provider_settings()
     execution = harness_lab_services.runtime.execution_plane_status()
     knowledge = harness_lab_services.knowledge.status()
+    artifacts = harness_lab_services.database.artifact_status()
     return {
         "success": True,
         "data": {
@@ -34,6 +35,11 @@ async def settings_catalog():
             "knowledge_chunk_count": knowledge.chunk_count,
             "knowledge_last_indexed_at": knowledge.last_indexed_at,
             "knowledge_index": knowledge.model_dump(),
+            "artifact_backend": artifacts.backend,
+            "artifact_ready": artifacts.ready,
+            "artifact_bucket_or_root": artifacts.bucket_or_root,
+            "artifact_last_error": artifacts.last_error,
+            "artifact_store": artifacts.model_dump(),
             "execution_plane": execution,
             "sandbox": harness_lab_services.sandbox.status().model_dump(),
         },
@@ -45,6 +51,7 @@ async def health():
     doctor = harness_lab_services.doctor_report()
     execution = doctor["execution_plane"]
     knowledge = doctor["knowledge"]
+    artifacts = doctor["artifacts"]
     return {
         "success": True,
         "data": {
@@ -52,6 +59,7 @@ async def health():
                 "healthy"
                 if execution["postgres_ready"]
                 and execution["redis_ready"]
+                and artifacts["ready"]
                 and execution["docker_ready"]
                 and execution["sandbox_image_ready"]
                 else "degraded"
@@ -74,6 +82,10 @@ async def health():
             "knowledge_chunk_count": knowledge["chunk_count"],
             "knowledge_last_indexed_at": knowledge["last_indexed_at"],
             "knowledge_fallback_mode": knowledge["fallback_mode"],
+            "artifact_backend": artifacts["backend"],
+            "artifact_ready": artifacts["ready"],
+            "artifact_bucket_or_root": artifacts["bucket_or_root"],
+            "artifact_last_error": artifacts["last_error"],
             "storage_backend": execution["storage_backend"],
             "postgres_ready": execution["postgres_ready"],
             "redis_ready": execution["redis_ready"],

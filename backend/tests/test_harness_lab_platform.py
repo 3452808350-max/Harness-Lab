@@ -117,6 +117,10 @@ def test_provider_settings_health_and_catalog(client, monkeypatch):
     assert health_data["model_ready"] is False
     assert health_data["fallback_mode"] is True
     assert health_data["base_url"] == "https://api.deepseek.com/v1"
+    assert health_data["artifact_backend"] == "local"
+    assert health_data["artifact_ready"] is True
+    assert "artifact_bucket_or_root" in health_data
+    assert health_data["artifact_last_error"] is None
     assert health_data["storage_backend"] == "sqlite_test"
     assert health_data["postgres_ready"] is True
     assert health_data["redis_ready"] is True
@@ -139,6 +143,11 @@ def test_provider_settings_health_and_catalog(client, monkeypatch):
     catalog_data = catalog.json()["data"]
     assert catalog_data["model_provider"]["default_model_name"] == "deepseek-chat"
     assert catalog_data["model_provider"]["fallback_mode"] is True
+    assert catalog_data["artifact_backend"] == "local"
+    assert catalog_data["artifact_ready"] is True
+    assert "artifact_bucket_or_root" in catalog_data
+    assert catalog_data["artifact_last_error"] is None
+    assert "artifact_store" in catalog_data
     assert catalog_data["execution_plane"]["storage_backend"] == "sqlite_test"
     assert "worker_count_by_state" in catalog_data["execution_plane"]
     assert "sandbox" in catalog_data
@@ -171,6 +180,37 @@ def test_model_backed_intent_and_run_trace(client, monkeypatch):
     assert run_payload["execution_trace"]["model_calls"][0]["provider"] == "deepseek"
     assert run_payload["execution_trace"]["model_calls"][0]["used_fallback"] is False
     assert run_payload["execution_trace"]["tool_calls"][0]["tool_name"] == "knowledge_search"
+
+
+def test_artifact_endpoints_expose_metadata_and_content(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session_payload = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Search the runtime implementation before making changes.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "execution_mode": "single_worker",
+        },
+    ).json()["data"]
+    run_payload = client.post("/api/runs", json={"session_id": session_payload["session_id"]}).json()["data"]
+
+    detail = client.get(f"/api/runs/{run_payload['run_id']}").json()
+    artifact = next(item for item in detail["artifacts"] if item["artifact_type"] == "context_bundle")
+
+    artifact_response = client.get(f"/api/artifacts/{artifact['artifact_id']}")
+    assert artifact_response.status_code == 200
+    artifact_payload = artifact_response.json()["data"]
+    assert artifact_payload["storage_backend"] == "local"
+    assert artifact_payload["storage_key"]
+    assert artifact_payload["locator"]
+
+    content_response = client.get(f"/api/artifacts/{artifact['artifact_id']}/content")
+    assert content_response.status_code == 200
+    assert content_response.headers["x-harness-artifact-id"] == artifact["artifact_id"]
+    assert content_response.headers["x-harness-artifact-backend"] == "local"
+    assert "backend/app/harness_lab/runtime" in content_response.text
 
 
 def test_invalid_model_payload_falls_back_without_leaking_secret(client, monkeypatch):

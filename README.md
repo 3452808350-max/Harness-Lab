@@ -21,6 +21,7 @@
 - natural-language constraints with deny-before-allow verdicts
 - fixed prompt frame ordering
 - replayable execution traces, approval chain, and artifact indexing
+- switchable artifact backend with local and S3-compatible storage support
 - lease-driven remote-worker protocol with mission / attempt / lease visibility
 - Docker-backed sandbox boundary for high-risk tool execution
 - role-aware mission orchestration with handoff packets, review verdicts, and mission-phase visibility
@@ -36,6 +37,8 @@
 - `POST /api/constraints/verify`
 - `POST /api/runs`
 - `GET /api/runs/{id}`
+- `GET /api/artifacts/{id}`
+- `GET /api/artifacts/{id}/content`
 - `POST /api/workers/register`
 - `POST /api/workers/{worker_id}/poll`
 - `GET /api/leases`
@@ -83,3 +86,4 @@ Open:
 - custom natural-language constraints still resolve through heuristic policy behavior instead of rich semantic rule compilation
 - multi-agent orchestration is now role-aware and replayable, but it is still workflow-bounded rather than a fully autonomous swarm
 - self-improvement now diagnoses multi-agent traces and auto-evaluates candidates, but it still only optimizes policy/workflow versions rather than platform source code
+- artifact storage now has a formal backend abstraction, but control-plane artifact reads are still proxy-based rather than presigned/object-native delivery
