@@ -26,6 +26,7 @@ from ..types import (
     PublishGateStatus,
     RecommendationType,
     ResearchRun,
+    ResearchSession,
     ReviewVerdict,
     RolloutInfo,
     RolloutRecommendation,
