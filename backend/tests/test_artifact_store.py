@@ -26,6 +26,14 @@ class FakeS3Client:
     def head_bucket(self, Bucket: str):  # noqa: N803
         return {}
 
+    def list_buckets(self):  # noqa: N803
+        """Return list of buckets - used for endpoint connectivity check."""
+        return {"Buckets": []}
+
+    def create_bucket(self, Bucket: str):  # noqa: N803
+        """Create bucket if it doesn't exist."""
+        return {}
+
 
 def test_local_artifact_store_round_trip(tmp_path):
     store = LocalFilesystemArtifactStore(tmp_path / "artifacts")
