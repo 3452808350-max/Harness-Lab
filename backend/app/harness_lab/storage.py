@@ -11,7 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .artifact_store import ArtifactStore, LocalFilesystemArtifactStore
-from .types import ApprovalRequestModel, ArtifactRef, ArtifactStoreStatus, EventEnvelope, Mission, TaskAttempt, WorkerLease
+from .types import ApprovalRequestModel, ArtifactRef, ArtifactStoreStatus, EventEnvelope, Mission, TaskAttempt, WorkerLease, HandoffPacket
 from .utils import json_dumps, new_id, utc_now
 
 
@@ -276,12 +276,30 @@ POSTGRES_SCHEMA_STATEMENTS = [
         updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS handoffs (
+        handoff_id TEXT PRIMARY KEY,
+        from_role TEXT NOT NULL,
+        to_role TEXT NOT NULL,
+        mission_id TEXT,
+        run_id TEXT NOT NULL,
+        task_node_id TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        required_action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_approvals_run_id ON approvals(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_task_attempts_run_id ON task_attempts(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_worker_leases_run_id ON worker_leases(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_worker_leases_worker_id ON worker_leases(worker_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, created_at)",
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_leases_active_task
     ON worker_leases(run_id, task_node_id)
@@ -532,6 +550,24 @@ CREATE TABLE IF NOT EXISTS worker_leases (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    from_role TEXT NOT NULL,
+    to_role TEXT NOT NULL,
+    mission_id TEXT,
+    run_id TEXT NOT NULL,
+    task_node_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    required_action TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, created_at);
 """
 
 
@@ -761,9 +797,209 @@ class PlatformStore(ABC):
             storage_backend="local",
             storage_key=row["relative_path"],
             relative_path=row["relative_path"],
-            metadata=payload,
             created_at=row["created_at"],
         )
+    
+    # === Handoff CRUD Methods ===
+    # Design source: Claude Plugin Module 05 - Coordinator Mode
+    
+    def create_handoff(
+        self,
+        handoff: HandoffPacket,
+        conn: Any | None = None,
+    ) -> HandoffPacket:
+        """Create handoff record in database.
+        
+        Args:
+            handoff: HandoffPacket to persist
+            conn: Optional connection
+            
+        Returns:
+            HandoffPacket (persisted)
+        """
+        self.upsert_row(
+            "handoffs",
+            {
+                "handoff_id": handoff.id,
+                "from_role": handoff.from_role,
+                "to_role": handoff.to_role,
+                "mission_id": handoff.mission_id,
+                "run_id": handoff.run_id,
+                "task_node_id": handoff.task_node_id,
+                "summary": handoff.summary,
+                "required_action": handoff.required_action,
+                "status": "pending",
+                "payload_json": json_dumps(handoff.model_dump()),
+                "created_at": handoff.created_at,
+                "updated_at": handoff.created_at,
+            },
+            "handoff_id",
+            conn=conn,
+        )
+        return handoff
+    
+    def get_handoff(
+        self,
+        handoff_id: str,
+        conn: Any | None = None,
+    ) -> Optional[HandoffPacket]:
+        """Get handoff by ID.
+        
+        Args:
+            handoff_id: Handoff ID
+            conn: Optional connection
+            
+        Returns:
+            HandoffPacket or None
+        """
+        row = self.fetchone(
+            "SELECT * FROM handoffs WHERE handoff_id = ?",
+            (handoff_id,),
+            conn=conn,
+        )
+        if not row:
+            return None
+        
+        return self._handoff_from_row(row)
+    
+    def list_handoffs_by_run(
+        self,
+        run_id: str,
+        status: Optional[str] = None,
+        conn: Any | None = None,
+    ) -> List[HandoffPacket]:
+        """List handoffs for a run.
+        
+        Args:
+            run_id: Run ID
+            status: Filter by status (optional)
+            conn: Optional connection
+            
+        Returns:
+            List of HandoffPacket
+        """
+        if status:
+            rows = self.fetchall(
+                "SELECT * FROM handoffs WHERE run_id = ? AND status = ? ORDER BY created_at",
+                (run_id, status),
+                conn=conn,
+            )
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM handoffs WHERE run_id = ? ORDER BY created_at",
+                (run_id,),
+                conn=conn,
+            )
+        
+        return [self._handoff_from_row(row) for row in rows]
+    
+    def list_pending_handoffs(
+        self,
+        to_role: Optional[str] = None,
+        conn: Any | None = None,
+    ) -> List[HandoffPacket]:
+        """List pending handoffs.
+        
+        Args:
+            to_role: Filter by target role (optional)
+            conn: Optional connection
+            
+        Returns:
+            List of pending HandoffPacket
+        """
+        if to_role:
+            rows = self.fetchall(
+                "SELECT * FROM handoffs WHERE status = 'pending' AND to_role = ? ORDER BY created_at",
+                (to_role,),
+                conn=conn,
+            )
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM handoffs WHERE status = 'pending' ORDER BY created_at",
+                (),
+                conn=conn,
+            )
+        
+        return [self._handoff_from_row(row) for row in rows]
+    
+    def update_handoff_status(
+        self,
+        handoff_id: str,
+        status: str,
+        conn: Any | None = None,
+    ) -> Optional[HandoffPacket]:
+        """Update handoff status.
+        
+        Args:
+            handoff_id: Handoff ID
+            status: New status
+            conn: Optional connection
+            
+        Returns:
+            Updated HandoffPacket or None
+        """
+        now = utc_now()
+        self.execute(
+            "UPDATE handoffs SET status = ?, updated_at = ? WHERE handoff_id = ?",
+            (status, now, handoff_id),
+            conn=conn,
+        )
+        
+        return self.get_handoff(handoff_id, conn=conn)
+    
+    def delete_handoff(
+        self,
+        handoff_id: str,
+        conn: Any | None = None,
+    ) -> bool:
+        """Delete handoff.
+        
+        Args:
+            handoff_id: Handoff ID
+            conn: Optional connection
+            
+        Returns:
+            True if deleted
+        """
+        row = self.fetchone(
+            "SELECT handoff_id FROM handoffs WHERE handoff_id = ?",
+            (handoff_id,),
+            conn=conn,
+        )
+        if not row:
+            return False
+        
+        self.execute(
+            "DELETE FROM handoffs WHERE handoff_id = ?",
+            (handoff_id,),
+            conn=conn,
+        )
+        
+        return True
+    
+    def _handoff_from_row(self, row: Dict[str, Any]) -> HandoffPacket:
+        """Convert database row to HandoffPacket.
+        
+        Args:
+            row: Database row
+            
+        Returns:
+            HandoffPacket
+        """
+        payload = json.loads(row["payload_json"]) if row.get("payload_json") else {}
+        
+        # Ensure all required fields are present
+        payload.setdefault("id", row["handoff_id"])
+        payload.setdefault("from_role", row["from_role"])
+        payload.setdefault("to_role", row["to_role"])
+        payload.setdefault("mission_id", row.get("mission_id"))
+        payload.setdefault("run_id", row["run_id"])
+        payload.setdefault("task_node_id", row["task_node_id"])
+        payload.setdefault("summary", row["summary"])
+        payload.setdefault("required_action", row["required_action"])
+        payload.setdefault("created_at", row["created_at"])
+        
+        return HandoffPacket(**payload)
 
     def create_approval(
         self,

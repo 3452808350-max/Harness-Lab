@@ -199,6 +199,25 @@ from .system import (
     DoctorReport,
 )
 
+# === Multi-Agent Coordinator Types ===
+# Design source: Claude Plugin Module 05 - Coordinator Mode
+
+from .decision import (
+    TaskContext,
+    ContinueVsSpawnDecision,
+)
+
+from .coordinator import (
+    CoordinatorConfig,
+    WorkflowPhase,
+    WorkerResult,
+    TaskDirective,
+    WorkerInfo,
+    CoordinatorState,
+    ResearchDirection,
+    ImplementationGroup,
+)
+
 __all__ = [
     # Base
     "ActionPlan",
@@ -364,6 +383,19 @@ __all__ = [
     "ArtifactRef",
     "ArtifactStoreStatus",
     "DoctorReport",
+    # === Multi-Agent Coordinator Types ===
+    # Decision engine
+    "TaskContext",
+    "ContinueVsSpawnDecision",
+    # Coordinator
+    "CoordinatorConfig",
+    "WorkflowPhase",
+    "WorkerResult",
+    "TaskDirective",
+    "WorkerInfo",
+    "CoordinatorState",
+    "ResearchDirection",
+    "ImplementationGroup",
 ]
 
 # Rebuild Pydantic models after all cross-module forward references are loaded.

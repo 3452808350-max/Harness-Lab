@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,10 +53,14 @@ from ..types import (
     WorkerPollResponse,
     WorkflowTemplateVersion,
 )
+from ..types.base import AgentRole
+from ..types.coordinator import CoordinatorConfig, WorkerResult
 from ..utils import new_id, utc_now
 from .models import ModelRegistry
 from ..orchestrator.service import OrchestratorService
+from ..orchestrator.coordinator import ParallelAgentCoordinator
 from .execution_plane import LocalWorkerAdapter, RunCoordinator
+from .handoff import AgentHandoffManager
 from ..fleet import create_protocol_adapters
 from ..fleet.lease_manager import LeaseManager
 from ..fleet.worker_registry import WorkerRegistry
@@ -64,7 +69,14 @@ from ..fleet.constraints import DispatchConstraintCalculator
 
 
 class RuntimeService:
-    """Harness-first runtime that turns sessions into traces and replays."""
+    """Harness-first runtime with multi-agent execution support.
+    
+    Supports two execution modes:
+    - single_worker: Sequential execution by one worker
+    - multi_agent: Parallel execution with Coordinator four-phase workflow
+    
+    Design source: Claude Plugin Module 05 - Coordinator Mode
+    """
 
     def __init__(
         self,
@@ -1659,3 +1671,399 @@ class RuntimeService:
             "run_id",
             conn=conn,
         )
+    
+    # === Multi-Agent Execution Extensions ===
+    # Design source: Claude Plugin Module 05 - Coordinator Mode
+    
+    def _setup_multi_agent_execution(self, run: ResearchRun, session: ResearchSession) -> ParallelAgentCoordinator:
+        """Initialize ParallelAgentCoordinator for multi_agent execution.
+        
+        Creates coordinator with dispatcher, orchestrator, and database
+        for four-phase workflow execution.
+        
+        Args:
+            run: ResearchRun to execute
+            session: ResearchSession context
+            
+        Returns:
+            ParallelAgentCoordinator instance
+        """
+        config = CoordinatorConfig(
+            max_parallel_workers=4,
+            default_timeout_ms=300000,
+            enable_verification=True,
+        )
+        
+        coordinator = ParallelAgentCoordinator(
+            orchestrator=self.orchestrator,
+            dispatcher=self.dispatcher,
+            database=self.database,
+            config=config,
+        )
+        
+        # Initialize handoff manager
+        self.handoff_manager = AgentHandoffManager(self.database)
+        
+        return coordinator
+    
+    async def drain_run_parallel(self, run_id: str) -> ResearchRun:
+        """Execute run using parallel multi-agent workflow.
+        
+        Alternative to drain_run for multi_agent execution mode.
+        Uses Coordinator's four-phase workflow:
+        1. Research - parallel investigation
+        2. Synthesis - coordinator processing
+        3. Implementation - file-grouped execution
+        4. Verification - fresh-eyes validation
+        
+        Args:
+            run_id: ResearchRun ID
+            
+        Returns:
+            ResearchRun after parallel execution
+        """
+        run = self.get_run(run_id)
+        session = self.get_session(run.session_id)
+        
+        # Setup coordinator
+        coordinator = self._setup_multi_agent_execution(run, session)
+        
+        # Record multi-agent mode activation
+        self.database.append_event(
+            "multi_agent.started",
+            {
+                "run_id": run_id,
+                "execution_mode": "multi_agent",
+                "max_parallel_workers": coordinator.config.max_parallel_workers,
+            },
+            session_id=session.session_id,
+            run_id=run_id,
+        )
+        
+        # Build multi-agent task graph
+        if session.intent_declaration:
+            session.task_graph = self.orchestrator.build_multi_agent_graph(
+                session,
+                session.intent_declaration,
+                self.get_workflow_template(session.workflow_template_id),
+            )
+        
+        # Execute coordinator workflow
+        try:
+            results = await coordinator._run_workflow_async(session, run)
+            
+            # Process results
+            total_workers = len(results)
+            successful_workers = sum(1 for r in results if r.success)
+            
+            # Update run status
+            if successful_workers == total_workers:
+                run.status = "completed"
+                run.execution_trace.status = "completed"
+                self._merge_run_result(
+                    run,
+                    {
+                        "summary": f"Multi-agent workflow completed with {successful_workers} workers",
+                        "multi_agent_results": [r.model_dump() for r in results],
+                    },
+                )
+            else:
+                run.status = "failed"
+                run.execution_trace.status = "failed"
+                self._merge_run_result(
+                    run,
+                    {
+                        "summary": f"Multi-agent workflow failed: {total_workers - successful_workers} workers failed",
+                        "multi_agent_results": [r.model_dump() for r in results],
+                    },
+                )
+            
+            # Persist final state
+            run.updated_at = utc_now()
+            run.execution_trace.updated_at = utc_now()
+            session.status = run.status
+            session.updated_at = utc_now()
+            
+            self._persist_run(run)
+            self._persist_session(session)
+            self._persist_replay(run)
+            
+            # Record completion event
+            self.database.append_event(
+                "multi_agent.completed",
+                {
+                    "run_id": run_id,
+                    "status": run.status,
+                    "total_workers": total_workers,
+                    "successful_workers": successful_workers,
+                },
+                session_id=session.session_id,
+                run_id=run_id,
+            )
+            
+        except Exception as e:
+            # Handle coordinator failure
+            run.status = "failed"
+            run.execution_trace.status = "failed"
+            self._merge_run_result(
+                run,
+                {
+                    "summary": f"Multi-agent workflow failed: {str(e)}",
+                    "error": str(e),
+                },
+            )
+            
+            run.updated_at = utc_now()
+            run.execution_trace.updated_at = utc_now()
+            session.status = "failed"
+            session.updated_at = utc_now()
+            
+            self._persist_run(run)
+            self._persist_session(session)
+            
+            self.database.append_event(
+                "multi_agent.failed",
+                {
+                    "run_id": run_id,
+                    "error": str(e),
+                },
+                session_id=session.session_id,
+                run_id=run_id,
+            )
+        
+        return self.get_run(run_id)
+    
+    async def create_run_with_multi_agent(self, request: RunRequest) -> ResearchRun:
+        """Create run with multi_agent execution mode.
+        
+        Extension of create_run that supports execution_mode="multi_agent".
+        Falls back to single_worker for backward compatibility.
+        
+        Args:
+            request: RunRequest with execution_mode
+            
+        Returns:
+            ResearchRun after creation and execution
+        """
+        # Create session with execution_mode
+        session_request = SessionRequest(
+            goal=request.goal or "Research the current workspace",
+            context=request.context,
+            constraint_set_id=request.constraint_set_id,
+            context_profile_id=request.context_profile_id,
+            prompt_template_id=request.prompt_template_id,
+            model_profile_id=request.model_profile_id,
+            workflow_template_id=request.workflow_template_id,
+            execution_mode=request.execution_mode or "single_worker",
+        )
+        
+        session = self.create_session(session_request)
+        
+        # Build run
+        run = await self._create_run_base(session, request)
+        
+        # Execute based on mode
+        execution_mode = session.execution_mode or "single_worker"
+        
+        if execution_mode == "multi_agent":
+            # Use parallel coordinator workflow
+            return await self.drain_run_parallel(run.run_id)
+        elif execution_mode == "single_worker":
+            # Use local worker adapter
+            return await self.local_worker_adapter.drain_run(run.run_id)
+        else:
+            # Default to single worker
+            return self.get_run(run.run_id)
+    
+    async def _create_run_base(self, session: ResearchSession, request: RunRequest) -> ResearchRun:
+        """Create run base without execution.
+        
+        Helper method for create_run_with_multi_agent.
+        
+        Args:
+            session: ResearchSession
+            request: RunRequest
+            
+        Returns:
+            ResearchRun (not yet executed)
+        """
+        self.reclaim_stale_leases()
+        
+        session.status = "running"
+        session.updated_at = utc_now()
+        self._persist_session(session)
+        self.database.append_event(
+            "run.planning_started",
+            {"session_id": session.session_id},
+            session_id=session.session_id,
+        )
+        
+        run_id = new_id("run")
+        context_profile = self.get_context_profile(session.context_profile_id)
+        prompt_template = self.get_prompt_template(session.prompt_template_id)
+        constraint_document = self.constraint_engine.get_document(session.constraint_set_id)
+        
+        session.constraint_root_document_id = session.constraint_root_document_id or constraint_document.root_document_id or constraint_document.document_id
+        session.constraint_version = session.constraint_version or constraint_document.version
+        
+        blocks, summary = self.context_manager.assemble(session, context_profile, session.intent_declaration)
+        prompt_frame = self.prompt_assembler.render(
+            session=session,
+            template=prompt_template,
+            constraint_document=constraint_document,
+            intent=session.intent_declaration,
+            blocks=blocks,
+            truncated_blocks=summary["truncated_blocks"],
+        )
+        
+        preflight_result = self.tool_gateway.preflight(session.intent_declaration.suggested_action, session.constraint_set_id)
+        verdicts = preflight_result["verdicts"]
+        final_verdict = preflight_result["final_verdict"]
+        
+        artifacts = [
+            self.tool_gateway.create_snapshot_manifest(run_id),
+            self.database.write_artifact_text(
+                run_id,
+                "context_bundle",
+                "context_blocks.json",
+                json.dumps([block.model_dump() for block in blocks], ensure_ascii=False, indent=2),
+                {"selection_summary": summary},
+            ),
+            self.database.write_artifact_text(
+                run_id,
+                "prompt_frame",
+                "prompt_frame.json",
+                json.dumps(prompt_frame.model_dump(), ensure_ascii=False, indent=2),
+                {"template_id": prompt_frame.template_id},
+            ),
+        ]
+        
+        trace = ExecutionTrace(
+            trace_id=new_id("trace"),
+            session_id=session.session_id,
+            prompt_frame_id=prompt_frame.prompt_frame_id,
+            constraint_document_id=constraint_document.document_id,
+            constraint_root_document_id=constraint_document.root_document_id or constraint_document.document_id,
+            constraint_version=constraint_document.version,
+            intent_declaration=session.intent_declaration,
+            model_calls=[session.intent_model_call] if session.intent_model_call else [],
+            context_blocks=blocks,
+            policy_verdicts=verdicts,
+            tool_calls=[],
+            recovery_events=[],
+            artifacts=artifacts,
+            status="running",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        
+        run = ResearchRun(
+            run_id=run_id,
+            session_id=session.session_id,
+            status="queued",
+            mission_id=new_id("mission"),
+            policy_id=session.active_policy_id,
+            workflow_template_id=session.workflow_template_id,
+            constraint_set_id=session.constraint_set_id,
+            constraint_root_document_id=session.constraint_root_document_id,
+            constraint_version=session.constraint_version,
+            prompt_frame=prompt_frame,
+            execution_trace=trace,
+            result={
+                "context_selection_summary": summary,
+                "final_verdict": final_verdict.model_dump(),
+            },
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        
+        mission = Mission(
+            mission_id=run.mission_id,
+            session_id=session.session_id,
+            run_id=run.run_id,
+            status="queued",
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+        )
+        
+        self._persist_run(run)
+        self.database.upsert_mission(mission)
+        
+        self.run_coordinator.mark_ready_nodes(session, run.run_id)
+        self._persist_session(session)
+        
+        return run
+    
+    def get_handoff_manager(self) -> AgentHandoffManager:
+        """Get or create handoff manager.
+        
+        Returns:
+            AgentHandoffManager instance
+        """
+        if not hasattr(self, 'handoff_manager'):
+            self.handoff_manager = AgentHandoffManager(self.database)
+        return self.handoff_manager
+    
+    def create_handoff(
+        self,
+        from_role: AgentRole,
+        to_role: AgentRole,
+        run: ResearchRun,
+        node: TaskNode,
+        summary: str,
+        artifacts: List[str],
+        required_action: str,
+    ) -> HandoffPacket:
+        """Create handoff between agent roles.
+        
+        Convenience method using AgentHandoffManager.
+        
+        Args:
+            from_role: AgentRole initiating handoff
+            to_role: AgentRole receiving handoff
+            run: ResearchRun context
+            node: TaskNode that triggered handoff
+            summary: Summary of findings/work
+            artifacts: List of artifact IDs
+            required_action: Action required by target
+            
+        Returns:
+            HandoffPacket
+        """
+        return self.get_handoff_manager().create_handoff(
+            from_role=from_role,
+            to_role=to_role,
+            run=run,
+            node=node,
+            summary=summary,
+            artifacts=artifacts,
+            required_action=required_action,
+        )
+    
+    def list_pending_handoffs(self, to_role: AgentRole, run_id: Optional[str] = None) -> List[HandoffPacket]:
+        """List pending handoffs for a role.
+        
+        Args:
+            to_role: Target AgentRole
+            run_id: Optional run ID filter
+            
+        Returns:
+            List of pending HandoffPackets
+        """
+        return self.get_handoff_manager().list_pending_handoffs(to_role, run_id)
+    
+    def process_handoff(self, handoff_id: str) -> Dict[str, Any]:
+        """Process handoff and get execution context.
+        
+        Args:
+            handoff_id: HandoffPacket ID
+            
+        Returns:
+            Dict with handoff and execution context
+        """
+        result = self.get_handoff_manager().process_handoff(handoff_id)
+        return {
+            "handoff": result.handoff.model_dump(),
+            "execution_context": result.execution_context,
+            "ready_for_execution": result.ready_for_execution,
+        }

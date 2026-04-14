@@ -548,6 +548,204 @@ class Dispatcher:
             "session_id",
             conn=conn,
         )
+    
+    # === Multi-Agent Dispatch Extensions ===
+    # Design source: Claude Plugin Module 05 - Coordinator Mode
+    
+    def next_dispatch_for_parallel_workers(
+        self,
+        workers: List[WorkerSnapshot],
+        coordination: RunCoordinationProtocol,
+        constraints: DispatchConstraintProtocol,
+        context: DispatchContextProtocol,
+        max_parallel: int = 4,
+    ) -> List[Tuple[WorkerSnapshot, DispatchEnvelope]]:
+        """Dispatch tasks to multiple workers in parallel wave.
+        
+        For multi-agent execution mode. Assigns ready tasks
+        to available workers based on role matching.
+        
+        Args:
+            workers: List of available WorkerSnapshot
+            coordination: Protocol for run coordination
+            constraints: Protocol for constraint checking
+            context: Protocol for building dispatch context
+            max_parallel: Maximum parallel dispatches
+            
+        Returns:
+            List of (worker, dispatch_envelope) tuples
+        """
+        if not workers:
+            return []
+        
+        # Filter available workers
+        available = [w for w in workers if w.state in {"idle", "registering"} and w.drain_state != "draining"]
+        
+        if not available:
+            return []
+        
+        # Group workers by role
+        role_workers: Dict[str, List[WorkerSnapshot]] = {}
+        for worker in available:
+            role = worker.role_profile or "executor"
+            if role not in role_workers:
+                role_workers[role] = []
+            role_workers[role].append(worker)
+        
+        # Get ready queue snapshot
+        queue_snapshot = self.queue.inspect_queues(limit=max_parallel * 2)
+        
+        # Match tasks to workers by role
+        dispatches: List[Tuple[WorkerSnapshot, DispatchEnvelope]] = []
+        
+        for shard_info in queue_snapshot:
+            shard = str(shard_info.get("shard", ""))
+            parts = shard.split("/")
+            shard_role = parts[0] if parts else "executor"
+            
+            # Find worker with matching role
+            matching_workers = role_workers.get(shard_role, [])
+            if not matching_workers:
+                # Fall back to any available worker
+                matching_workers = available
+            
+            for worker in matching_workers[:max_parallel]:
+                if len(dispatches) >= max_parallel:
+                    break
+                
+                # Check if this worker already has a dispatch
+                if any(d[0].worker_id == worker.worker_id for d in dispatches):
+                    continue
+                
+                # Try to dispatch to this worker
+                dispatch = self.next_dispatch_for_worker(
+                    worker,
+                    coordination,
+                    constraints,
+                    context,
+                    reclaim_first=False,  # Already reclaimed above
+                )
+                
+                if dispatch:
+                    dispatches.append((worker, dispatch))
+        
+        return dispatches
+    
+    def _find_worker_for_role(
+        self,
+        role: str,
+        workers: List[WorkerSnapshot],
+    ) -> Optional[WorkerSnapshot]:
+        """Find best worker for a specific role.
+        
+        Priority:
+        1. Worker with matching role_profile
+        2. Worker with role in labels
+        3. Any available worker
+        
+        Args:
+            role: AgentRole to match
+            workers: List of available workers
+            
+        Returns:
+            Best matching WorkerSnapshot or None
+        """
+        # First: exact role match
+        for worker in workers:
+            if worker.role_profile == role:
+                return worker
+        
+        # Second: role in labels
+        for worker in workers:
+            if role in (worker.labels or []):
+                return worker
+        
+        # Third: any available
+        for worker in workers:
+            if worker.state in {"idle", "registering"}:
+                return worker
+        
+        return None
+    
+    def _worker_can_poll_shard_extended(
+        self,
+        worker: WorkerSnapshot,
+        shard: str,
+        require_role_match: bool = False,
+    ) -> bool:
+        """Extended shard polling check with optional role requirement.
+        
+        Args:
+            worker: WorkerSnapshot
+            shard: Shard string
+            require_role_match: If True, require exact role match
+            
+        Returns:
+            True if worker can poll from shard
+        """
+        if worker.drain_state == "draining":
+            return False
+        
+        parts = shard.split("/")
+        shard_role = parts[0] if parts else None
+        
+        # Role matching
+        if require_role_match and shard_role:
+            if worker.role_profile and worker.role_profile != shard_role:
+                return False
+            # Also check labels
+            if shard_role not in (worker.labels or []) and worker.role_profile != shard_role:
+                return False
+        
+        # Original label check
+        labels = parts[2:] if len(parts) > 2 else []
+        worker_labels = set(worker.labels or [])
+        if labels and "unlabeled" not in labels:
+            if not all(label in worker_labels for label in labels):
+                return False
+        
+        return True
+    
+    def get_role_queue_depth(self, role: str) -> int:
+        """Get queue depth for a specific role shard.
+        
+        Args:
+            role: AgentRole to check
+            
+        Returns:
+            Number of tasks in role shard
+        """
+        depths = self.queue.queue_depth_by_shard()
+        role_depth = 0
+        for shard, depth in depths.items():
+            parts = str(shard).split("/")
+            shard_role = parts[0] if parts else "executor"
+            if shard_role == role:
+                role_depth += depth
+        return role_depth
+    
+    def list_available_workers_by_role(self, role: str) -> List[WorkerSnapshot]:
+        """List available workers for a specific role.
+        
+        Args:
+            role: AgentRole to filter
+            
+        Returns:
+            List of available WorkerSnapshot with matching role
+        """
+        workers = self.worker_registry.list_workers()
+        available = [w for w in workers if w.state in {"idle", "registering"} and w.drain_state != "draining"]
+        
+        # Filter by role
+        matching = []
+        for worker in available:
+            if worker.role_profile == role:
+                matching.append(worker)
+            elif role in (worker.labels or []):
+                matching.append(worker)
+        
+        # Fall back to all available if no role match
+        return matching if matching else available
 
 
 class InMemoryDispatcher(Dispatcher):
