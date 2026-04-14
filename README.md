@@ -1,16 +1,17 @@
-... 正在录音 ...# Harness Lab
+# Harness Lab
 
-本仓库当前是一个`研究优先、可回放、正在向生产型多 agent 平台演进`的 Harness 平台，不再是旧工作流产品，也还不是最终形态的生产级 agent 云。
+Harness Lab 是一个研究优先、可回放、面向生产化演进的多 agent 平台。它不是旧工作流产品，也还不是最终形态的 agent 云，但当前已经具备一条完整的控制平面、执行边界、约束治理和前端工作台链路。
 
 ## What It Is
 
 - `backend/app/harness_lab/context`: 分层 context 管理
-- `backend/app/harness_lab/constraints`: 自然语言约束与 policy verdict
-- `backend/app/harness_lab/boundary`: 工具边界、patch staging、workspace 审计
-- `backend/app/harness_lab/orchestrator`: task graph 与 wave-ready 调度
+- `backend/app/harness_lab/constraints`: 自然语言约束解析、编译与 policy verdict
+- `backend/app/harness_lab/boundary`: sandbox 执行边界、patch staging、workspace 审计
+- `backend/app/harness_lab/fleet`: worker、lease、dispatch、协议和适配层
 - `backend/app/harness_lab/runtime`: session / run / mission / attempt / lease runtime
-- `backend/app/harness_lab/improvement`: candidate、eval harness、publish gate
+- `backend/app/harness_lab/improvement`: candidate、eval harness、publish gate、canary
 - `backend/app/harness_lab/control_plane`: sessions、runs、workers、leases、replays、evals API
+- `backend/app/harness_lab/orchestrator`: task graph 与 wave-ready 调度
 - `frontend/src/lab`: Harness Lab mission-control workbench
 
 ## Core Capabilities
@@ -21,59 +22,77 @@
 - natural-language constraints with deny-before-allow verdicts
 - fixed prompt frame ordering
 - replayable execution traces, approval chain, and artifact indexing
-- switchable artifact backend with local filesystem and S3-compatible object storage (MinIO for dev, AWS S3 for production)
+- artifact storage with local filesystem and S3-compatible backends
 - lease-driven remote-worker protocol with mission / attempt / lease visibility
-- Pluggable sandbox execution backend with `SandboxExecutor` abstraction layer
-  - **Docker** (default, production-ready): hardened container with rootless, no-new-privileges, capability drop
-  - **MicroVM** (real backend): Firecracker-style local runner with readiness probes, VM trace metadata, and artifact-backed evidence
-  - **MicroVM stub** (fallback/testing only): validates abstraction compatibility when a real MicroVM backend is unavailable
-  - Backend selection via `HARNESS_SANDBOX_BACKEND` environment variable
-  - Unified `SandboxSpec/SandboxTrace/SandboxResult` contracts across all backends
-- role-aware mission orchestration with handoff packets, review verdicts, and mission-phase visibility
+- pluggable sandbox execution backend through `SandboxExecutor`
+  - `docker` default backend with hardened container settings
+  - `microvm` real local runner backend with readiness probes and VM trace metadata
+  - `microvm_stub` fallback backend for compatibility checks and tests
+- role-aware mission orchestration with handoff packets and review verdicts
 - offline replay / benchmark evaluation and strict candidate publish gate
-- multi-agent self-improvement loop that diagnoses traces, generates policy/workflow candidates, and auto-runs replay + benchmark gate checks
+- multi-agent self-improvement loop that diagnoses traces, generates candidates, and runs replay / benchmark checks
 
-## Main API Surface
+## Repository Layout
 
-- `POST /api/sessions`
-- `POST /api/intent/declare`
-- `POST /api/context/assemble`
-- `POST /api/prompts/render`
-- `POST /api/constraints/verify`
-- `POST /api/runs`
-- `GET /api/runs/{id}`
-- `GET /api/artifacts/{id}`
-- `GET /api/artifacts/{id}/content`
-- `POST /api/workers/register`
-- `POST /api/workers/{worker_id}/poll`
-- `GET /api/leases`
-- `POST /api/leases/{lease_id}/heartbeat`
-- `POST /api/leases/{lease_id}/complete`
-- `GET /api/replays/{id}`
-- `POST /api/evals/replay`
-- `POST /api/evals/benchmark`
+```text
+backend/
+  app/harness_lab/
+    boundary/
+    control_plane/
+    context/
+    constraints/
+    fleet/
+    improvement/
+    orchestrator/
+    runtime/
+    types/
+  tests/
+frontend/
+docker/
+```
+
+## Requirements
+
+- Python 3.11+
+- Node.js 18+
+- Docker and Docker Compose
+- Postgres and Redis for runtime state
 
 ## Local Development
 
-### Infra
-```bash
-# Start all infrastructure services (Postgres, Redis, MinIO)
-docker compose -f docker/docker-compose.yml up -d
+### 1. Start infrastructure
 
-# Or start individual services
-docker compose -f docker/docker-compose.yml up -d harness-lab-postgres harness-lab-redis
-docker compose -f docker/docker-compose.yml up -d harness-lab-minio  # For S3 artifact backend
+```bash
+docker compose -f docker/docker-compose.yml up -d harness-lab-postgres harness-lab-redis harness-lab-minio
 ```
 
-### Backend
+The full compose stack also brings up the backend and frontend:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+### 2. Configure environment
+
+At minimum, set these variables:
+
 ```bash
 export HARNESS_DB_URL=postgresql://harness_lab:harness_lab@127.0.0.1:5432/harness_lab
 export HARNESS_REDIS_URL=redis://127.0.0.1:6379/0
-python3 -m uvicorn backend.app.main:app --reload --port 4600
 ```
 
+Optional but commonly used:
+
 ```bash
-# Optional: switch sandbox backend to the real local MicroVM runner
+export HARNESS_SANDBOX_BACKEND=docker
+export HARNESS_ARTIFACT_BACKEND=local
+export HARNESS_ARTIFACT_ROOT=backend/data/harness_lab/artifacts
+export HARNESS_WORKER_POLL_INTERVAL=1.0
+```
+
+For the local MicroVM runner:
+
+```bash
 export HARNESS_SANDBOX_BACKEND=microvm
 export HARNESS_MICROVM_BINARY=python3
 export HARNESS_MICROVM_KERNEL_IMAGE=backend/data/harness_lab/microvm/vmlinux.bin
@@ -81,47 +100,82 @@ export HARNESS_MICROVM_ROOTFS_IMAGE=backend/data/harness_lab/microvm/rootfs.img
 export HARNESS_MICROVM_WORKDIR=backend/data/harness_lab/microvm/workdir
 ```
 
-### Frontend
+### 3. Run the backend
+
+```bash
+python3 -m backend.app.main
+```
+
+The API listens on `http://localhost:4600` and exposes docs at `http://localhost:4600/docs`.
+
+You can also use the CLI entrypoint:
+
+```bash
+python3 -m backend.app.harness_lab.cli serve
+```
+
+### 4. Run the frontend
+
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-### CLI Worker
+The workbench opens at `http://localhost:3000`.
+
+### 5. Run a worker daemon
+
 ```bash
 python3 -m backend.app.harness_lab.cli worker serve --label cli-worker
+```
+
+## Useful CLI Commands
+
+```bash
+python3 -m backend.app.harness_lab.cli doctor
+python3 -m backend.app.harness_lab.cli sandbox probe
+python3 -m backend.app.harness_lab.cli sandbox backend
+python3 -m backend.app.harness_lab.cli queue inspect
+python3 -m backend.app.harness_lab.cli leases
+python3 -m backend.app.harness_lab.cli workers
+python3 -m backend.app.harness_lab.cli eval --suite replay
 ```
 
 ## Test Matrix
 
 ```bash
-# Default backend regression
+# Backend regression
 pytest backend/tests -q
 
 # Focused sandbox + platform regression
 pytest backend/tests/unit/test_sandbox_hardening.py \
   backend/tests/unit/test_microvm_executor.py \
-  backend/tests/test_sandbox_boundary.py \
   backend/tests/test_harness_lab_platform.py -q
-```
 
-```bash
-# Optional infra-backed integration checks
-docker compose -f docker/docker-compose.yml up -d harness-lab-postgres harness-lab-redis harness-lab-minio
+# Integration checks
 pytest backend/tests/integration -q
 ```
 
-Open:
-- Workbench: `http://localhost:3000`
-- API docs: `http://localhost:4600/docs`
+Frontend checks:
+
+```bash
+cd frontend
+npm run build
+npm run lint
+npm test
+```
 
 ## Current Limits
 
 - single-user local control plane only
-- lease-driven remote worker plane now runs against real Postgres + Redis and has been smoke-tested through `session -> run -> worker poll -> lease -> complete`; the local SQLite path survives only as an injected test store, not a runtime backend
-- sandboxing now supports both Docker and a real `microvm` backend with kernel/rootfs/workdir readiness checks; the local runner is production-shape infrastructure, but not yet a full multi-tenant VM fabric
-- semantic constraints are now parsed, compiled, and verified through a dedicated engine with deny-before-allow verdicts, matched rule explanations, and operator-facing governance workbench; the current limitation is authoring/governance UX depth rather than core engine capability
-- multi-agent orchestration is now role-aware and replayable, but it is still workflow-bounded rather than a fully autonomous swarm
-- self-improvement now diagnoses multi-agent traces and auto-evaluates candidates, but it still only optimizes policy/workflow versions rather than platform source code
-- artifact storage supports both local filesystem and S3-compatible backends with real-time health checks; control plane proxies artifact reads consistently across backends
+- runtime state requires Postgres + Redis; SQLite is no longer supported for runtime state
+- sandboxing supports `docker`, `microvm`, and `microvm_stub`, but the real `microvm` backend is still a local runner rather than a full multi-tenant VM fabric
+- semantic constraints are governed through a dedicated engine with deny-before-allow verdicts, but the authoring and rollout UX can still be deepened
+- multi-agent orchestration is role-aware and replayable, but still workflow-bounded rather than fully autonomous
+- self-improvement currently optimizes policy/workflow versions rather than the platform source tree itself
+
+## See Also
+
+- [Maintenance notes](MAINTENANCE.md)
+- [Frontend README](frontend/README.md)
