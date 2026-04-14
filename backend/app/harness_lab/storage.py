@@ -567,6 +567,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, created_at);
 """
 
@@ -797,6 +798,7 @@ class PlatformStore(ABC):
             storage_backend="local",
             storage_key=row["relative_path"],
             relative_path=row["relative_path"],
+            metadata=payload if isinstance(payload, dict) else {},
             created_at=row["created_at"],
         )
     

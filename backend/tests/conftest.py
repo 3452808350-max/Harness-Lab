@@ -12,7 +12,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = REPO_ROOT / "backend"
+APP_ROOT = BACKEND_ROOT / "app"
 
-for candidate in (str(REPO_ROOT), str(BACKEND_ROOT)):
+for candidate in (str(REPO_ROOT), str(BACKEND_ROOT), str(APP_ROOT)):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
