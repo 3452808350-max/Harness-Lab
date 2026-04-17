@@ -8,5 +8,12 @@ Provides:
 
 from .app import HarnessLabTUI
 from .theme import ColorTheme
+from .api_client import APIConfig, ControlPlaneClient, create_client
 
-__all__ = ["HarnessLabTUI", "ColorTheme"]
+__all__ = [
+    "HarnessLabTUI",
+    "ColorTheme",
+    "APIConfig",
+    "ControlPlaneClient",
+    "create_client",
+]

@@ -100,14 +100,15 @@ class WorkerTable(DataTable):
     
     def _styled_state(self, state: str) -> str:
         """Get styled state string."""
+        # State color mapping as specified
         icons = {
             "idle": "🟢",
-            "executing": "🔵",
             "leased": "🟡",
+            "executing": "🟡",
             "draining": "🟡",
-            "registering": "⚪",
-            "unhealthy": "🔴",
             "offline": "⚫",
+            "unhealthy": "🔴",
+            "registering": "🔵",
         }
         icon = icons.get(state.lower(), "⚪")
         return f"{icon} {state}"
