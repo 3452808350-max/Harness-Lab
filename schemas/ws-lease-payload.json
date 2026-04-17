@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://harness.lab/schemas/ws-lease-payload.json",
+  "title": "LeaseEventPayload",
+  "description": "Payload schema for lease-related WebSocket events",
+  "type": "object",
+  "properties": {
+    "lease_id": {
+      "type": "string",
+      "description": "Unique lease identifier"
+    },
+    "worker_id": {
+      "type": "string",
+      "description": "Worker that holds the lease"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Run this lease belongs to"
+    },
+    "task_node_id": {
+      "type": "string",
+      "description": "Task node being executed"
+    },
+    "attempt_id": {
+      "type": "string",
+      "description": "Task attempt ID"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["leased", "running", "completed", "failed", "released", "expired"],
+      "description": "Current lease status"
+    },
+    "previous_status": {
+      "type": "string",
+      "enum": ["leased", "running", "completed", "failed", "released", "expired"],
+      "description": "Previous lease status (for transition events)"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Lease expiration timestamp"
+    },
+    "heartbeat_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last heartbeat timestamp"
+    },
+    "heartbeat_interval_seconds": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 60,
+      "default": 10,
+      "description": "Heartbeat interval in seconds"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error message (for lease_failed events)"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Completion summary (for lease_completed events)"
+    },
+    "leases": {
+      "type": "array",
+      "items": {"type": "object"},
+      "description": "Array of lease snapshots (for lease_snapshot)"
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total lease count (for snapshots)"
+    },
+    "filters": {
+      "type": "object",
+      "description": "Active filters for the connection"
+    }
+  },
+  "required": ["lease_id", "worker_id", "run_id", "status"]
+}

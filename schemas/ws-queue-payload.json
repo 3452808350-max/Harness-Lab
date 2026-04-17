@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://harness.lab/schemas/ws-queue-payload.json",
+  "title": "QueueEventPayload",
+  "description": "Payload schema for queue-related WebSocket events",
+  "type": "object",
+  "properties": {
+    "shard": {
+      "type": "string",
+      "default": "default",
+      "description": "Queue shard name"
+    },
+    "depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Current queue depth"
+    },
+    "previous_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Previous queue depth (for depth changes)"
+    },
+    "change": {
+      "type": "integer",
+      "description": "Depth change delta"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Run ID (for task events)"
+    },
+    "task_node_id": {
+      "type": "string",
+      "description": "Task node ID (for task events)"
+    },
+    "enqueued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Enqueue timestamp (for queue_task_enqueued)"
+    },
+    "dequeued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Dequeue timestamp (for queue_task_dequeued)"
+    },
+    "sample_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string"},
+          "task_node_id": {"type": "string"}
+        }
+      },
+      "description": "Sample tasks in queue"
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "shard": {"type": "string"},
+          "depth": {"type": "integer"},
+          "sample_tasks": {
+            "type": "array",
+            "items": {"type": "object"}
+          }
+        }
+      },
+      "description": "Array of shard statuses (for queue_snapshot)"
+    },
+    "total_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total depth across all shards"
+    },
+    "filters": {
+      "type": "object",
+      "description": "Active filters for the connection"
+    }
+  },
+  "required": ["shard", "depth"]
+}

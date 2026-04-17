@@ -26,6 +26,8 @@ from backend.app.harness_lab.control_plane.sessions import router as sessions_ro
 from backend.app.harness_lab.control_plane.system import router as system_router
 from backend.app.harness_lab.control_plane.workers import router as workers_router
 from backend.app.harness_lab.control_plane.workflows import router as workflows_router
+from backend.app.harness_lab.control_plane.websocket import router as websocket_router
+from backend.app.harness_lab.control_plane.websocket import initialize_websocket_support, shutdown_websocket_support
 
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
@@ -34,6 +36,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     services = initialize_harness_lab_services()
+    await initialize_websocket_support()
     stop_event = asyncio.Event()
 
     async def sweep_loop() -> None:
@@ -57,6 +60,7 @@ async def lifespan(_app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+        await shutdown_websocket_support()
         shutdown_harness_lab_services()
 
 
@@ -94,6 +98,7 @@ app.include_router(workflows_router)
 app.include_router(failure_clusters_router)
 app.include_router(workers_router)
 app.include_router(system_router)
+app.include_router(websocket_router)
 
 
 @app.get("/")

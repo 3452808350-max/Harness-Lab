@@ -2,6 +2,14 @@
 
 Depends on protocol interfaces rather than concrete RuntimeService.
 Part of the fleet module for unified worker fleet coordination.
+
+WebSocket Hooks (added 2026-04-18):
+    - acquire_lease (via _create_dispatch): broadcast lease.acquired
+    - heartbeat_lease: broadcast lease.heartbeat
+    - release_lease: broadcast lease.released
+    - complete_lease: broadcast lease.completed
+    - fail_lease: broadcast lease.failed
+    - expire_lease (via _reclaim_lease): broadcast lease.expired
 """
 
 from __future__ import annotations
@@ -10,7 +18,7 @@ import json
 import inspect
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .protocols import (
     DispatchConstraintProtocol,
@@ -44,11 +52,18 @@ from ..types import (
 )
 from ..utils import new_id, utc_now
 
+if TYPE_CHECKING:
+    from ..control_plane.websocket_publisher import WebSocketEventPublisher
+
 
 class LeaseManager:
     """Lease manager depending on protocols, not RuntimeService.
     
     This version can be instantiated independently and migrated to fleet/.
+    
+    WebSocket Integration:
+        Optionally publishes lease lifecycle events via WebSocketEventPublisher.
+        Events: acquired, heartbeat, released, completed, failed, expired
     """
 
     def __init__(
@@ -64,7 +79,24 @@ class LeaseManager:
         orchestrator: Any,  # OrchestratorService
         dispatcher: Any = None,  # Dispatcher - optional for backward compat during migration
         lease_timeout_seconds: int = 30,
+        ws_publisher: Optional[WebSocketEventPublisher] = None,
     ) -> None:
+        """Initialize lease manager.
+        
+        Args:
+            database: PlatformStore for persistence
+            coordination: RunCoordinationProtocol
+            constraints: DispatchConstraintProtocol
+            context: DispatchContextProtocol
+            execution: TaskExecutionProtocol
+            utilities: UtilityProtocol
+            worker_registry: WorkerRegistry
+            dispatch_queue: DispatchQueue
+            orchestrator: OrchestratorService
+            dispatcher: Dispatcher (optional)
+            lease_timeout_seconds: Lease timeout
+            ws_publisher: WebSocketEventPublisher (optional)
+        """
         self.database = database
         self.coordination = coordination
         self.constraints = constraints
@@ -76,10 +108,15 @@ class LeaseManager:
         self.orchestrator = orchestrator
         self.dispatcher = dispatcher
         self.lease_timeout_seconds = lease_timeout_seconds
+        self.ws_publisher = ws_publisher
         self.reclaimed_lease_count = 0
         self.last_lease_sweep_at: Optional[str] = None
         self.last_lease_sweep_report = LeaseSweepReport()
         self.late_callback_count = 0
+    
+    def set_ws_publisher(self, publisher: WebSocketEventPublisher) -> None:
+        """Set WebSocket publisher after initialization."""
+        self.ws_publisher = publisher
 
     def _runtime(self):
         """Access the backing RuntimeService when adapters are in use."""
@@ -147,7 +184,10 @@ class LeaseManager:
         return WorkerPollResponse(dispatches=dispatches)
 
     def heartbeat_lease(self, lease_id: str, request: WorkerHeartbeatRequest) -> WorkerLease:
-        """Process lease heartbeat."""
+        """Process lease heartbeat.
+        
+        WebSocket Hook: broadcasts lease.heartbeat.
+        """
         lease = self.database.get_lease(lease_id)
         if lease.status not in {"leased", "running"}:
             return lease
@@ -178,6 +218,14 @@ class LeaseManager:
             run_id=lease.run_id,
         )
         
+        # WebSocket hook: broadcast lease heartbeat
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_lease_heartbeat(
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                status=lease.status,
+            )
+        
         # Update worker via registry
         self.worker_registry.heartbeat(
             lease.worker_id,
@@ -187,7 +235,10 @@ class LeaseManager:
         return lease
 
     async def complete_lease(self, lease_id: str, request: LeaseCompletionRequest) -> ResearchRun:
-        """Complete a lease."""
+        """Complete a lease.
+        
+        WebSocket Hook: broadcasts lease.completed.
+        """
         lease = self.database.get_lease(lease_id)
         if lease.status not in {"leased", "running"}:
             self._record_ignored_completion(lease, "lease.complete_ignored")
@@ -237,10 +288,22 @@ class LeaseManager:
         
         self._append_lease_event("lease.completed", lease, run, session)
         
+        # WebSocket hook: broadcast lease completed
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_lease_completed(
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                task_node_id=lease.task_node_id,
+                summary=request.summary,
+            )
+        
         return await self.coordination.advance_after_lease_transition(run, session, node)
 
     async def fail_lease(self, lease_id: str, request: LeaseFailureRequest) -> ResearchRun:
-        """Fail a lease."""
+        """Fail a lease.
+        
+        WebSocket Hook: broadcasts lease.failed.
+        """
         lease = self.database.get_lease(lease_id)
         if lease.status not in {"leased", "running"}:
             self._record_ignored_completion(lease, "lease.fail_ignored", error=request.error)
@@ -283,10 +346,22 @@ class LeaseManager:
         
         self._append_lease_event("lease.failed", lease, run, session, error=request.error)
         
+        # WebSocket hook: broadcast lease failed
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_lease_failed(
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                task_node_id=lease.task_node_id,
+                error=request.error,
+            )
+        
         return await self.coordination.advance_after_lease_transition(run, session, node)
 
     async def release_lease(self, lease_id: str, request: LeaseReleaseRequest) -> ResearchRun:
-        """Release a lease."""
+        """Release a lease.
+        
+        WebSocket Hook: broadcasts lease.released.
+        """
         lease = self.database.get_lease(lease_id)
         run = self._get_run(lease.run_id)
         session = self._get_session(run.session_id)
@@ -321,6 +396,14 @@ class LeaseManager:
         self.dispatch_queue.clear_lease(lease.lease_id)
         
         self._append_lease_event("lease.released", lease, run, session, reason=request.reason)
+        
+        # WebSocket hook: broadcast lease released
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_lease_released(
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                reason=request.reason,
+            )
         
         return await self.coordination.advance_after_lease_transition(run, session, node)
 
@@ -922,7 +1005,10 @@ class LeaseManager:
             self.database.record_artifact_ref(artifact)
 
     def _reclaim_lease(self, lease: WorkerLease) -> bool:
-        """Reclaim a single expired lease."""
+        """Reclaim a single expired lease.
+        
+        WebSocket Hook: broadcasts lease.expired.
+        """
         current_time = utc_now()
         lease.status = "expired"
         lease.heartbeat_at = current_time
@@ -980,6 +1066,15 @@ class LeaseManager:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            
+            # WebSocket hook: broadcast lease expired
+            if self.ws_publisher:
+                self.ws_publisher.broadcast_lease_expired(
+                    lease_id=lease.lease_id,
+                    worker_id=lease.worker_id,
+                    task_node_id=lease.task_node_id,
+                )
+            
             return True
         except ValueError:
             return False

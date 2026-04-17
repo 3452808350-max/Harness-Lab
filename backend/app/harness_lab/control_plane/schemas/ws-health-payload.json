@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ws-health-payload.json",
+  "title": "WebSocket Health Payload",
+  "description": "Payload schema for health-related WebSocket events",
+  "type": "object",
+  "definitions": {
+    "HealthStatus": {
+      "type": "object",
+      "properties": {
+        "postgres_ready": {
+          "type": "boolean",
+          "description": "PostgreSQL database is ready"
+        },
+        "redis_ready": {
+          "type": "boolean",
+          "description": "Redis is ready"
+        },
+        "docker_ready": {
+          "type": "boolean",
+          "description": "Docker/sandbox is ready"
+        },
+        "model_ready": {
+          "type": "boolean",
+          "description": "Model provider is ready"
+        },
+        "knowledge_ready": {
+          "type": "boolean",
+          "description": "Knowledge index is ready"
+        },
+        "artifacts_ready": {
+          "type": "boolean",
+          "description": "Artifact store is ready"
+        },
+        "sandbox_ready": {
+          "type": "boolean",
+          "description": "Sandbox backend is ready"
+        }
+      }
+    },
+    "WorkerHealth": {
+      "type": "object",
+      "properties": {
+        "healthy_workers": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of healthy worker IDs"
+        },
+        "unhealthy_workers": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of unhealthy worker IDs"
+        },
+        "draining_workers": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of draining worker IDs"
+        },
+        "offline_workers": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of offline worker IDs"
+        },
+        "worker_count": {
+          "type": "integer",
+          "description": "Total worker count"
+        },
+        "healthy_count": {
+          "type": "integer",
+          "description": "Healthy worker count"
+        }
+      }
+    },
+    "DoctorReport": {
+      "type": "object",
+      "description": "Full doctor report from Harness Lab",
+      "properties": {
+        "control_plane": {
+          "type": "object",
+          "properties": {
+            "sessions": {"type": "integer"},
+            "runs": {"type": "integer"},
+            "policies": {"type": "integer"},
+            "workflows": {"type": "integer"}
+          }
+        },
+        "provider": {
+          "type": "object",
+          "properties": {
+            "model_ready": {"type": "boolean"},
+            "provider": {"type": "string"},
+            "profile": {"type": "string"}
+          }
+        },
+        "knowledge": {
+          "type": "object",
+          "properties": {
+            "ready": {"type": "boolean"},
+            "fallback_mode": {"type": "boolean"}
+          }
+        },
+        "artifacts": {
+          "type": "object",
+          "properties": {
+            "ready": {"type": "boolean"},
+            "backend": {"type": "string"}
+          }
+        },
+        "sandbox": {
+          "type": "object",
+          "properties": {
+            "sandbox_backend": {"type": "string"},
+            "executor_ready": {"type": "boolean"},
+            "sandbox_image_ready": {"type": "boolean"},
+            "hardened_ready": {"type": "boolean"}
+          }
+        },
+        "workers": {
+          "type": "object",
+          "properties": {
+            "count": {"type": "integer"},
+            "healthy": {"type": "integer"},
+            "by_state": {"type": "object"},
+            "by_role": {"type": "object"},
+            "unhealthy_workers": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "active_workers": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          }
+        },
+        "execution_plane": {
+          "type": "object",
+          "properties": {
+            "postgres_ready": {"type": "boolean"},
+            "redis_ready": {"type": "boolean"},
+            "stuck_runs": {
+              "type": "array",
+              "items": {"type": "object"}
+            }
+          }
+        },
+        "improvement_plane": {
+          "type": "object",
+          "properties": {
+            "candidates": {"type": "integer"},
+            "published_candidates": {"type": "integer"},
+            "evaluations": {"type": "integer"}
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "doctor_ready": {"type": "boolean"}
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "description": "Health update event payload",
+      "properties": {
+        "status": {"type": "string", "enum": ["healthy", "degraded", "unhealthy"]},
+        "postgres_ready": {"type": "boolean"},
+        "redis_ready": {"type": "boolean"},
+        "docker_ready": {"type": "boolean"},
+        "model_ready": {"type": "boolean"},
+        "knowledge_ready": {"type": "boolean"},
+        "artifacts_ready": {"type": "boolean"},
+        "sandbox_ready": {"type": "boolean"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "System health event payload",
+      "properties": {
+        "overall_status": {"type": "string"},
+        "components": {"$ref": "#/definitions/HealthStatus"},
+        "workers": {"$ref": "#/definitions/WorkerHealth"},
+        "stuck_runs": {"type": "integer"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Component health event payload",
+      "required": ["component", "healthy"],
+      "properties": {
+        "component": {"type": "string"},
+        "healthy": {"type": "boolean"},
+        "message": {"type": "string"},
+        "last_check": {"type": "string", "format": "date-time"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Initial state snapshot - health status",
+      "required": ["postgres_ready", "redis_ready", "docker_ready"],
+      "properties": {
+        "postgres_ready": {"type": "boolean"},
+        "redis_ready": {"type": "boolean"},
+        "docker_ready": {"type": "boolean"},
+        "healthy_workers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "unhealthy_workers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "draining_workers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "stuck_runs": {"type": "integer"},
+        "overall_status": {"type": "string"}
+      }
+    },
+    {
+      "$ref": "#/definitions/DoctorReport"
+    }
+  ]
+}

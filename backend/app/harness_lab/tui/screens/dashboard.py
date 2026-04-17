@@ -5,6 +5,11 @@ Shows:
 - Service status panel (left)
 - Worker table (center/right)
 - Event stream (bottom)
+
+WebSocket Integration:
+- Uses EnhancedAPIClient for HTTP + WebSocket hybrid
+- Receives real-time events via WebSocket
+- Falls back to HTTP polling when WebSocket disconnected
 """
 
 from __future__ import annotations
@@ -22,6 +27,20 @@ from textual.reactive import reactive
 from ..widgets import ServicePanel, WorkerTable, StatusBar, EventStream, QueuePanel
 from ..theme import ColorTheme
 from ..api_client import ControlPlaneClient, APIConfig
+from ..enhanced_client import EnhancedAPIClient, HybridConfig, create_enhanced_client
+from ..ws_client import ConnectionState
+from ..ws_worker import (
+    WSWorkerJoined,
+    WSWorkerLeft,
+    WSWorkerStateChanged,
+    WSTaskDispatched,
+    WSTaskCompleted,
+    WSHealthUpdate,
+    WSQueueUpdate,
+    WSInitialState,
+    WSHeartbeat,
+    WSConnectionState,
+)
 from .workers import WorkerDetailScreen
 
 
@@ -42,6 +61,11 @@ class DashboardScreen(Screen):
     ├───────────────────────────────────────┤
     │ Status Bar                             │
     └───────────────────────────────────────┘
+    
+    WebSocket Mode:
+    - Real-time updates via WebSocket events
+    - Typed message handlers: on_ws_worker_joined, etc.
+    - HTTP fallback when WebSocket disconnected
     """
     
     DEFAULT_CSS = """
@@ -107,13 +131,20 @@ class DashboardScreen(Screen):
         self,
         theme: ColorTheme = None,
         api_url: str = "http://localhost:4600",
+        ws_url: str = None,
+        use_mock_ws: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.theme = theme or ColorTheme.dark()
         self.api_url = api_url
+        self.ws_url = ws_url
+        self.use_mock_ws = use_mock_ws
         
-        # API client
+        # Enhanced API client (HTTP + WebSocket)
+        self._enhanced_client: Optional[EnhancedAPIClient] = None
+        
+        # HTTP client for operations (kept for backwards compatibility)
         self._api_config = APIConfig(base_url=api_url)
         self._api_client: Optional[ControlPlaneClient] = None
         
@@ -121,8 +152,12 @@ class DashboardScreen(Screen):
         self._workers_cache: Dict[str, Dict] = {}
         
         # Connection state
-        self._api_connected = False
+        self._ws_connected = False
+        self._http_connected = False
         self._using_demo_data = False
+        
+        # Fallback polling timer
+        self._fallback_timer = None
     
     def compose(self) -> ComposeResult:
         """Compose dashboard layout."""
@@ -144,67 +179,93 @@ class DashboardScreen(Screen):
         header = self.query_one("#header", Header)
         header.title = "Harness Lab Control Plane"
         
-        # Initialize API client connection (async)
-        self._init_api_connection()
-        
-        # Start polling for updates (every 2 seconds)
-        self.set_interval(2.0, self._poll_status)
+        # Initialize enhanced client connection (async)
+        self._init_enhanced_connection()
     
     def on_unmount(self) -> None:
         """Cleanup on unmount."""
-        # Disconnect API client (async cleanup)
+        # Stop fallback timer
+        if self._fallback_timer:
+            self._fallback_timer.stop()
+            self._fallback_timer = None
+        
+        # Disconnect enhanced client (async cleanup)
+        if self._enhanced_client:
+            asyncio.create_task(self._enhanced_client.disconnect())
+        
         if self._api_client:
             asyncio.create_task(self._api_client.disconnect())
     
-    def _init_api_connection(self) -> None:
-        """Initialize API client connection."""
-        self._api_client = ControlPlaneClient(self._api_config)
+    def _init_enhanced_connection(self) -> None:
+        """Initialize enhanced API client connection."""
+        # Create enhanced client with HTTP + WebSocket
+        self._enhanced_client = create_enhanced_client(
+            api_url=self.api_url,
+            ws_url=self.ws_url,
+            fallback_poll_interval=30.0,
+        )
+        
+        # Set event handler for WebSocket events
+        self._enhanced_client.set_event_handler(self._handle_ws_event)
         
         # Start async connection
-        asyncio.create_task(self._connect_api())
+        asyncio.create_task(self._connect_enhanced())
     
-    async def _connect_api(self) -> None:
-        """Connect to API asynchronously."""
+    async def _connect_enhanced(self) -> None:
+        """Connect to enhanced client asynchronously."""
         try:
-            connected = await self._api_client.connect()
+            connected = await self._enhanced_client.connect()
             if connected:
-                self._api_connected = True
+                self._http_connected = True
+                self._ws_connected = self._enhanced_client.ws_state == ConnectionState.CONNECTED
                 self._using_demo_data = False
+                
+                # Keep HTTP client reference for operations
+                self._api_client = self._enhanced_client._http
                 
                 # Log successful connection
                 events = self.query_one("#event-stream", EventStream)
+                mode = self._enhanced_client.mode
                 events.add_event(
                     datetime.now().strftime("%H:%M:%S"),
                     "CONNECT",
-                    f"API connected at {self.api_url}"
+                    f"Connected ({mode}): {self.api_url}"
                 )
                 
-                # Immediately fetch data
-                await self._poll_status()
+                # If WebSocket not connected, start fallback polling
+                if not self._ws_connected:
+                    self._start_http_fallback()
             else:
-                self._api_connected = False
+                self._http_connected = False
+                self._ws_connected = False
                 self._using_demo_data = True
                 
                 # Log connection failure and use demo data
                 events = self.query_one("#event-stream", EventStream)
-                error = self._api_client.last_error or "Unknown error"
+                error = self._enhanced_client.last_error or "Unknown error"
+                events.add_event(
+                    datetime.now().strftime("%H:%M:%S"),
+                    "ERROR",
+                    f"Connection failed: {error}"
+                )
                 events.add_event(
                     datetime.now().strftime("%H:%M:%S"),
                     "INFO",
-                    "Using demo data (API unavailable)"
+                    "Using demo data fallback"
                 )
                 
-                # Initialize with demo data as fallback
+                # Initialize with demo data
                 self._init_demo_data()
         except Exception as e:
-            self._api_connected = False
+            self._http_connected = False
+            self._ws_connected = False
             self._using_demo_data = True
             
             events = self.query_one("#event-stream", EventStream)
             events.add_event(
                 datetime.now().strftime("%H:%M:%S"),
                 "ERROR",
-                f"API init error: {str(e)}"
+                f"Connection error: {str(e)}"
             )
             events.add_event(
                 datetime.now().strftime("%H:%M:%S"),
@@ -212,8 +273,353 @@ class DashboardScreen(Screen):
                 "Using demo data fallback"
             )
             
-            # Initialize with demo data as fallback
             self._init_demo_data()
+    
+    # === WebSocket Event Handlers ===
+    
+    async def _handle_ws_event(self, data: Dict) -> None:
+        """Handle WebSocket event from enhanced client."""
+        event_type = data.get("event_type", "unknown")
+        
+        # Log all events
+        events = self.query_one("#event-stream", EventStream)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        if event_type == "initial_state":
+            await self._handle_initial_state(data.get("data", {}))
+            events.add_event(timestamp, "INIT", "Initial state loaded")
+            
+        elif event_type == "worker_joined":
+            await self._handle_worker_joined(data.get("data", {}))
+            
+        elif event_type == "worker_left":
+            await self._handle_worker_left(data.get("data", {}))
+            
+        elif event_type == "worker_state_changed":
+            await self._handle_worker_state_changed(data.get("data", {}))
+            
+        elif event_type == "task_dispatched":
+            await self._handle_task_dispatched(data.get("data", {}))
+            
+        elif event_type == "task_completed":
+            await self._handle_task_completed(data.get("data", {}))
+            
+        elif event_type == "health_update":
+            await self._handle_health_update(data.get("data", {}))
+            
+        elif event_type == "queue_update":
+            await self._handle_queue_update(data.get("data", {}))
+            
+        elif event_type == "heartbeat":
+            # Heartbeat received - connection healthy
+            events.add_event(timestamp, "HEARTBEAT", "WS connection healthy")
+            
+        elif event_type == "fallback_poll":
+            # HTTP fallback poll result
+            await self._handle_fallback_poll(data.get("data", {}))
+            events.add_event(timestamp, "POLL", "HTTP fallback update")
+            
+        elif event_type == "fallback_error":
+            # HTTP fallback error
+            error = data.get("data", {}).get("error", "Unknown")
+            events.add_event(timestamp, "ERROR", f"Fallback error: {error}")
+    
+    # === Typed WebSocket Message Handlers (App-level) ===
+    
+    def on_ws_worker_joined(self, message: WSWorkerJoined) -> None:
+        """Handle WSWorkerJoined message."""
+        asyncio.create_task(self._handle_worker_joined({
+            "worker_id": message.worker_id,
+            "role": message.role,
+            "state": message.state,
+        }))
+    
+    def on_ws_worker_left(self, message: WSWorkerLeft) -> None:
+        """Handle WSWorkerLeft message."""
+        asyncio.create_task(self._handle_worker_left({
+            "worker_id": message.worker_id,
+        }))
+    
+    def on_ws_worker_state_changed(self, message: WSWorkerStateChanged) -> None:
+        """Handle WSWorkerStateChanged message."""
+        asyncio.create_task(self._handle_worker_state_changed({
+            "worker_id": message.worker_id,
+            "old_state": message.old_state,
+            "new_state": message.new_state,
+            "task_id": message.task_id,
+        }))
+    
+    def on_ws_task_dispatched(self, message: WSTaskDispatched) -> None:
+        """Handle WSTaskDispatched message."""
+        asyncio.create_task(self._handle_task_dispatched({
+            "task_id": message.task_id,
+            "worker_id": message.worker_id,
+        }))
+    
+    def on_ws_task_completed(self, message: WSTaskCompleted) -> None:
+        """Handle WSTaskCompleted message."""
+        asyncio.create_task(self._handle_task_completed({
+            "task_id": message.task_id,
+            "worker_id": message.worker_id,
+            "success": message.success,
+        }))
+    
+    def on_ws_health_update(self, message: WSHealthUpdate) -> None:
+        """Handle WSHealthUpdate message."""
+        asyncio.create_task(self._handle_health_update(message.health_data))
+    
+    def on_ws_queue_update(self, message: WSQueueUpdate) -> None:
+        """Handle WSQueueUpdate message."""
+        asyncio.create_task(self._handle_queue_update(message.queues_data))
+    
+    def on_ws_initial_state(self, message: WSInitialState) -> None:
+        """Handle WSInitialState message."""
+        asyncio.create_task(self._handle_initial_state({
+            "health": message.health,
+            "workers": message.workers,
+            "queues": message.queues,
+        }))
+    
+    def on_ws_heartbeat(self, message: WSHeartbeat) -> None:
+        """Handle WSHeartbeat message."""
+        events = self.query_one("#event-stream", EventStream)
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "HEARTBEAT",
+            "WS connection healthy"
+        )
+    
+    def on_ws_connection_state(self, message: WSConnectionState) -> None:
+        """Handle WSConnectionState message."""
+        events = self.query_one("#event-stream", EventStream)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        if message.state == ConnectionState.CONNECTED:
+            self._ws_connected = True
+            events.add_event(timestamp, "WS_CONNECTED", "WebSocket connected")
+            # Stop fallback polling
+            self._stop_http_fallback()
+            
+        elif message.state == ConnectionState.DISCONNECTED:
+            self._ws_connected = False
+            events.add_event(timestamp, "WS_DISCONNECTED", "WebSocket disconnected")
+            # Start fallback polling if HTTP still connected
+            if self._http_connected:
+                self._start_http_fallback()
+                
+        elif message.state == ConnectionState.RECONNECTING:
+            events.add_event(timestamp, "WS_RECONNECT", f"Reconnecting (attempt {message.retry_count})")
+            
+        elif message.state == ConnectionState.ERROR:
+            self._ws_connected = False
+            events.add_event(timestamp, "WS_ERROR", f"WebSocket error: {message.error}")
+            # Start fallback polling if HTTP still connected
+            if self._http_connected:
+                self._start_http_fallback()
+    
+    # === WebSocket Event Processing ===
+    
+    async def _handle_initial_state(self, data: Dict) -> None:
+        """Handle initial state snapshot."""
+        # Update services
+        health = data.get("health", {})
+        self._update_services(health)
+        
+        # Update workers
+        workers = data.get("workers", [])
+        self._sync_workers(workers)
+        
+        # Update queues
+        queues = data.get("queues", [])
+        self._update_queues(queues)
+    
+    async def _handle_worker_joined(self, data: Dict) -> None:
+        """Handle worker joined event."""
+        worker_id = data.get("worker_id")
+        role = data.get("role", "general")
+        state = data.get("state", "idle")
+        
+        if not worker_id:
+            return
+        
+        workers_table = self.query_one("#worker-table", WorkerTable)
+        events = self.query_one("#event-stream", EventStream)
+        
+        # Add to table and cache
+        workers_table.add_worker(worker_id, state, role, "-", "-")
+        self._workers_cache[worker_id] = {
+            "state": state, "role": role, "task": "-", "lease": "-"
+        }
+        
+        # Log event
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "REGISTER",
+            f"{worker_id} ({role}) joined"
+        )
+        
+        # Update counter
+        self.workers_count = len(self._workers_cache)
+    
+    async def _handle_worker_left(self, data: Dict) -> None:
+        """Handle worker left event."""
+        worker_id = data.get("worker_id")
+        
+        if not worker_id:
+            return
+        
+        workers_table = self.query_one("#worker-table", WorkerTable)
+        events = self.query_one("#event-stream", EventStream)
+        
+        # Remove from table and cache
+        if worker_id in self._workers_cache:
+            workers_table.remove_worker(worker_id)
+            del self._workers_cache[worker_id]
+            
+            # Log event
+            events.add_event(
+                datetime.now().strftime("%H:%M:%S"),
+                "OFFLINE",
+                f"{worker_id} left"
+            )
+        
+        # Update counter
+        self.workers_count = len(self._workers_cache)
+    
+    async def _handle_worker_state_changed(self, data: Dict) -> None:
+        """Handle worker state change event."""
+        worker_id = data.get("worker_id")
+        old_state = data.get("old_state")
+        new_state = data.get("new_state")
+        task_id = data.get("task_id")
+        
+        if not worker_id:
+            return
+        
+        workers_table = self.query_one("#worker-table", WorkerTable)
+        events = self.query_one("#event-stream", EventStream)
+        
+        # Update table and cache
+        lease = "active" if task_id else "-"
+        workers_table.update_worker(worker_id, new_state, task_id or "-", lease)
+        
+        if worker_id in self._workers_cache:
+            self._workers_cache[worker_id]["state"] = new_state
+            self._workers_cache[worker_id]["task"] = task_id or "-"
+            self._workers_cache[worker_id]["lease"] = lease
+        
+        # Log event
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "STATE",
+            f"{worker_id}: {old_state} → {new_state}"
+        )
+    
+    async def _handle_task_dispatched(self, data: Dict) -> None:
+        """Handle task dispatched event."""
+        task_id = data.get("task_id")
+        worker_id = data.get("worker_id")
+        
+        if not task_id or not worker_id:
+            return
+        
+        events = self.query_one("#event-stream", EventStream)
+        
+        # Log event
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "DISPATCH",
+            f"{task_id} → {worker_id}"
+        )
+        
+        # Update task counter
+        self.tasks_count += 1
+    
+    async def _handle_task_completed(self, data: Dict) -> None:
+        """Handle task completed event."""
+        task_id = data.get("task_id")
+        worker_id = data.get("worker_id")
+        success = data.get("success", True)
+        
+        if not task_id or not worker_id:
+            return
+        
+        events = self.query_one("#event-stream", EventStream)
+        
+        # Log event
+        status = "✓" if success else "✗"
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "COMPLETE",
+            f"{task_id} {status} ({worker_id})"
+        )
+    
+    async def _handle_health_update(self, data: Dict) -> None:
+        """Handle health update event."""
+        self._update_services(data)
+    
+    async def _handle_queue_update(self, data: List) -> None:
+        """Handle queue update event."""
+        self._update_queues(data)
+    
+    async def _handle_fallback_poll(self, data: Dict) -> None:
+        """Handle HTTP fallback poll result."""
+        # Same as initial state
+        await self._handle_initial_state(data)
+    
+    # === HTTP Fallback ===
+    
+    def _start_http_fallback(self) -> None:
+        """Start HTTP polling fallback when WebSocket disconnected."""
+        if self._fallback_timer:
+            return  # Already running
+        
+        events = self.query_one("#event-stream", EventStream)
+        events.add_event(
+            datetime.now().strftime("%H:%M:%S"),
+            "INFO",
+            "Starting HTTP fallback polling"
+        )
+        
+        # Poll every 30 seconds
+        self._fallback_timer = self.set_interval(30.0, self._http_poll_fallback)
+    
+    def _stop_http_fallback(self) -> None:
+        """Stop HTTP polling fallback."""
+        if self._fallback_timer:
+            self._fallback_timer.stop()
+            self._fallback_timer = None
+            
+            events = self.query_one("#event-stream", EventStream)
+            events.add_event(
+                datetime.now().strftime("%H:%M:%S"),
+                "INFO",
+                "Stopped HTTP fallback (WebSocket connected)"
+            )
+    
+    async def _http_poll_fallback(self) -> None:
+        """HTTP polling fallback when WebSocket unavailable."""
+        if not self._http_connected or not self._enhanced_client:
+            return
+        
+        try:
+            # Fetch via HTTP (enhanced client already handles caching)
+            health = await self._enhanced_client.get_health()
+            workers = await self._enhanced_client.list_workers()
+            queues = await self._enhanced_client.get_queues()
+            
+            # Update displays
+            self._update_services(health)
+            self._sync_workers(workers)
+            self._update_queues(queues)
+            
+        except Exception as e:
+            events = self.query_one("#event-stream", EventStream)
+            events.add_event(
+                datetime.now().strftime("%H:%M:%S"),
+                "ERROR",
+                f"Fallback poll error: {str(e)}"
+            )
     
     def _init_demo_data(self) -> None:
         """Initialize with demo/test data (fallback when API unavailable)."""
@@ -251,80 +657,6 @@ class DashboardScreen(Screen):
             "w-03": {"state": "draining", "role": "reviewer", "task": "T-41", "lease": "5s"},
             "w-04": {"state": "offline", "role": "planner", "task": "-", "lease": "-"},
         }
-    
-    async def _poll_status(self) -> None:
-        """Poll control plane API for status updates.
-        
-        When connected:
-        - Fetch health, workers, and queues data in parallel
-        - Update ServicePanel, WorkerTable, QueuePanel, StatusBar
-        - Handle connection errors gracefully
-        """
-        if not self._api_connected or not self._api_client:
-            # Use demo simulation when not connected
-            await self._poll_demo()
-            return
-        
-        try:
-            # Fetch health, workers, and queues in parallel
-            health_task = asyncio.create_task(self._api_client.get_health())
-            workers_task = asyncio.create_task(self._api_client.list_workers())
-            queues_task = asyncio.create_task(self._api_client.get_queues())
-            
-            health_data, workers_data, queues_data = await asyncio.gather(
-                health_task, workers_task, queues_task, return_exceptions=True
-            )
-            
-            # Handle health data
-            if isinstance(health_data, Exception):
-                events = self.query_one("#event-stream", EventStream)
-                events.add_event(
-                    datetime.now().strftime("%H:%M:%S"),
-                    "ERROR",
-                    f"Health check failed: {str(health_data)}"
-                )
-            else:
-                self._update_services(health_data)
-            
-            # Handle workers data
-            if isinstance(workers_data, Exception):
-                events = self.query_one("#event-stream", EventStream)
-                events.add_event(
-                    datetime.now().strftime("%H:%M:%S"),
-                    "ERROR",
-                    f"Workers fetch failed: {str(workers_data)}"
-                )
-            else:
-                self._sync_workers(workers_data)
-            
-            # Handle queues data
-            if isinstance(queues_data, Exception):
-                events = self.query_one("#event-stream", EventStream)
-                events.add_event(
-                    datetime.now().strftime("%H:%M:%S"),
-                    "ERROR",
-                    f"Queue fetch failed: {str(queues_data)}"
-                )
-            else:
-                self._update_queues(queues_data)
-            
-        except Exception as e:
-            events = self.query_one("#event-stream", EventStream)
-            events.add_event(
-                datetime.now().strftime("%H:%M:%S"),
-                "ERROR",
-                f"Poll error: {str(e)}"
-            )
-            
-            # Check if connection lost
-            if self._api_client and not self._api_client.is_connected:
-                self._api_connected = False
-                self._using_demo_data = True
-                events.add_event(
-                    datetime.now().strftime("%H:%M:%S"),
-                    "ERROR",
-                    "Connection lost, using demo data"
-                )
     
     def _update_services(self, health_data: Dict) -> None:
         """Update service panel based on health data."""
@@ -436,24 +768,6 @@ class DashboardScreen(Screen):
                     "state": state, "role": role, "task": task, "lease": lease
                 }
     
-    async def _poll_demo(self) -> None:
-        """Demo mode polling simulation."""
-        # For demo mode, just add simulated events
-        events = self.query_one("#event-stream", EventStream)
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        # Simulate events
-        import random
-        event_types = ["HEARTBEAT", "DISPATCH"]
-        workers = ["w-01", "w-02", "w-03"]
-        worker = random.choice(workers)
-        event_type = random.choice(event_types)
-        
-        if event_type == "HEARTBEAT":
-            events.add_event(timestamp, "HEARTBEAT", f"{worker} (idle)")
-        else:
-            events.add_event(timestamp, "DISPATCH", f"T-{random.randint(50,100)} → {worker}")
-    
     def action_show_help(self) -> None:
         """Show help overlay."""
         self.app.push_screen("help")
@@ -494,9 +808,12 @@ class DashboardScreen(Screen):
         
         events = self.query_one("#event-stream", EventStream)
         
-        if self._api_connected and self._api_client:
+        # Use enhanced client if available
+        client = self._enhanced_client or self._api_client
+        
+        if self._http_connected and client:
             try:
-                result = await self._api_client.drain_worker(worker_id, reason="Manual drain via TUI")
+                result = await client.drain_worker(worker_id, reason="Manual drain via TUI")
                 new_state = result.get("state", "draining")
                 
                 # Update cache and table
@@ -564,9 +881,12 @@ class DashboardScreen(Screen):
         
         events = self.query_one("#event-stream", EventStream)
         
-        if self._api_connected and self._api_client:
+        # Use enhanced client if available
+        client = self._enhanced_client or self._api_client
+        
+        if self._http_connected and client:
             try:
-                result = await self._api_client.resume_worker(worker_id)
+                result = await client.resume_worker(worker_id)
                 new_state = result.get("state", "idle")
                 
                 # Update cache and table
@@ -626,11 +946,14 @@ class DashboardScreen(Screen):
         
         worker_id = worker_ids[cursor_row]
         
+        # Use enhanced client if available
+        client = self._enhanced_client._http if self._enhanced_client else self._api_client
+        
         # Push worker detail screen
         self.app.push_screen(
             WorkerDetailScreen(
                 worker_id=worker_id,
-                api_client=self._api_client,
+                api_client=client,
                 theme=self.theme
             )
         )
@@ -638,7 +961,11 @@ class DashboardScreen(Screen):
     def on_screen_resume(self) -> None:
         """Refresh data when returning from a sub-screen."""
         # Trigger immediate refresh after returning from worker detail screen
-        asyncio.create_task(self._poll_status())
+        if self._http_connected:
+            asyncio.create_task(self._http_poll_fallback())
+        elif self._ws_connected and self._enhanced_client:
+            # WebSocket connected - request initial state
+            asyncio.create_task(self._enhanced_client.request_initial_state())
     
     def action_toggle_logs(self) -> None:
         """Toggle log visibility."""

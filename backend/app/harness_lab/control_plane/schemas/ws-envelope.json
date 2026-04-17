@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ws-envelope.json",
+  "title": "WebSocket Message Envelope",
+  "description": "Standard envelope format for all WebSocket messages in Harness Lab Control Plane",
+  "type": "object",
+  "required": ["event_type", "timestamp", "sequence", "data"],
+  "properties": {
+    "event_type": {
+      "type": "string",
+      "description": "Event type identifier",
+      "enum": [
+        "connection_ack",
+        "initial_state",
+        "heartbeat",
+        "heartbeat_ack",
+        "pong",
+        "subscribed",
+        "unsubscribed",
+        "error",
+        "worker_joined",
+        "worker_left",
+        "worker_state_changed",
+        "worker_drain",
+        "worker_resume",
+        "worker_heartbeat",
+        "task_dispatched",
+        "task_started",
+        "task_completed",
+        "task_failed",
+        "lease_created",
+        "lease_released",
+        "lease_expired",
+        "lease_heartbeat",
+        "queue_update",
+        "queue_shard_update",
+        "queue_depth_change",
+        "health_update",
+        "system_health",
+        "component_health",
+        "doctor_report",
+        "run_created",
+        "run_started",
+        "run_completed",
+        "run_failed",
+        "run_stuck",
+        "system_event",
+        "policy_verdict",
+        "approval_request",
+        "approval_decision"
+      ]
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix timestamp in milliseconds",
+      "minimum": 0
+    },
+    "sequence": {
+      "type": "integer",
+      "description": "Sequence number for message ordering",
+      "minimum": 0
+    },
+    "data": {
+      "type": "object",
+      "description": "Event payload data"
+    },
+    "filters": {
+      "type": "object",
+      "description": "Filter hints for routing (optional)",
+      "properties": {
+        "worker_id": {
+          "type": "string",
+          "description": "Worker ID filter hint"
+        },
+        "lease_id": {
+          "type": "string",
+          "description": "Lease ID filter hint"
+        },
+        "run_id": {
+          "type": "string",
+          "description": "Run ID filter hint"
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "event_type": "worker_joined",
+      "timestamp": 1713402000000,
+      "sequence": 1,
+      "data": {
+        "worker_id": "worker-001",
+        "role": "executor",
+        "state": "idle",
+        "hostname": "worker-host-1",
+        "pid": 12345
+      },
+      "filters": {
+        "worker_id": "worker-001"
+      }
+    },
+    {
+      "event_type": "heartbeat",
+      "timestamp": 1713402030000,
+      "sequence": 2,
+      "data": {
+        "connection_count": 5
+      }
+    }
+  ]
+}

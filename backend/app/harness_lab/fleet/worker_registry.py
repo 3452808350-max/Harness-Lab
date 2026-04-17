@@ -12,13 +12,20 @@ Migration Plan:
 Rationale:
     Worker registry should be a pure data layer, while acquisition
     strategy belongs to fleet coordination.
+
+WebSocket Hooks (added 2026-04-18):
+    - register_worker: broadcast worker.registered
+    - heartbeat: broadcast worker.heartbeat, worker.state_changed
+    - drain_worker: broadcast worker.drain
+    - resume_worker: broadcast worker.resume
+    - set_state: broadcast worker.state_changed
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from ..storage import PlatformStore
 from ..types import (
@@ -30,17 +37,39 @@ from ..types import (
 )
 from ..utils import new_id, utc_now
 
+if TYPE_CHECKING:
+    from ..control_plane.websocket_publisher import WebSocketEventPublisher
+
 
 class WorkerRegistry:
     """Pure data layer for worker lifecycle management.
     
     Evolved from workers/service.py WorkerService.
     Does NOT handle worker acquisition strategy (moved to fleet coordinator).
+    
+    WebSocket Integration:
+        Optionally publishes worker lifecycle events via WebSocketEventPublisher.
+        Events: registered, heartbeat, state_changed, drain, resume, offline, unhealthy
     """
 
-    def __init__(self, database: PlatformStore) -> None:
+    def __init__(
+        self,
+        database: PlatformStore,
+        ws_publisher: Optional[WebSocketEventPublisher] = None,
+    ) -> None:
+        """Initialize worker registry.
+        
+        Args:
+            database: PlatformStore for persistence
+            ws_publisher: WebSocketEventPublisher for event broadcasting (optional)
+        """
         self.database = database
+        self.ws_publisher = ws_publisher
         self.offline_after_seconds = 90
+    
+    def set_ws_publisher(self, publisher: WebSocketEventPublisher) -> None:
+        """Set WebSocket publisher after initialization."""
+        self.ws_publisher = publisher
 
     def list_workers(self) -> List[WorkerSnapshot]:
         """List all workers with derived state."""
@@ -55,7 +84,10 @@ class WorkerRegistry:
         return self._derive_state(WorkerSnapshot(**json.loads(row["payload_json"])))
 
     def register_worker(self, request: WorkerRegisterRequest) -> WorkerSnapshot:
-        """Register a new worker."""
+        """Register a new worker.
+        
+        WebSocket Hook: broadcasts worker.registered event.
+        """
         now = utc_now()
         role_suffix = request.role_profile or "general"
         worker_class = "sandboxed" if request.sandbox_ready else "general"
@@ -91,11 +123,28 @@ class WorkerRegistry:
             updated_at=now,
         )
         self._persist(snapshot)
+        
+        # WebSocket hook: broadcast worker registered
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_worker_registered(
+                worker_id=snapshot.worker_id,
+                label=snapshot.label,
+                role=snapshot.role_profile or "general",
+                capabilities=snapshot.capabilities,
+                hostname=snapshot.hostname,
+                pid=snapshot.pid,
+            )
+        
         return snapshot
 
     def heartbeat(self, worker_id: str, request: WorkerHeartbeatRequest) -> WorkerSnapshot:
-        """Update worker heartbeat."""
+        """Update worker heartbeat.
+        
+        WebSocket Hook: broadcasts worker.heartbeat and worker.state_changed if state changed.
+        """
         worker = self.get_worker(worker_id)
+        old_state = worker.state
+        
         worker.state = request.state
         worker.lease_count = request.lease_count
         worker.current_run_id = request.current_run_id
@@ -116,6 +165,28 @@ class WorkerRegistry:
         if worker.drain_state == "draining" and worker.current_lease_id:
             worker.state = "draining"
         self._persist(worker)
+        
+        # WebSocket hooks
+        if self.ws_publisher:
+            # Broadcast heartbeat
+            self.ws_publisher.broadcast_worker_heartbeat(
+                worker_id=worker.worker_id,
+                state=worker.state,
+                lease_count=worker.lease_count,
+                current_run_id=worker.current_run_id,
+                current_lease_id=worker.current_lease_id,
+            )
+            
+            # Broadcast state change if different
+            if old_state != worker.state:
+                self.ws_publisher.broadcast_worker_state_changed(
+                    worker_id=worker.worker_id,
+                    old_state=old_state,
+                    new_state=worker.state,
+                    current_run_id=worker.current_run_id,
+                    current_lease_id=worker.current_lease_id,
+                )
+        
         return worker
 
     def record_sandbox_execution(
@@ -158,8 +229,13 @@ class WorkerRegistry:
         return worker
 
     def set_drain_state(self, worker_id: str, drain_state: str, reason: Optional[str] = None) -> WorkerSnapshot:
-        """Set worker drain state (active/draining)."""
+        """Set worker drain state (active/draining).
+        
+        WebSocket Hook: broadcasts worker.drain or worker.resume.
+        """
         worker = self.get_worker(worker_id)
+        old_state = worker.state
+        
         worker.drain_state = drain_state  # type: ignore
         if drain_state == "draining" and not worker.current_lease_id:
             worker.state = "draining"
@@ -169,10 +245,34 @@ class WorkerRegistry:
             worker.last_error = reason
         worker.updated_at = utc_now()
         self._persist(worker)
+        
+        # WebSocket hook
+        if self.ws_publisher:
+            if drain_state == "draining":
+                self.ws_publisher.broadcast_worker_drain(
+                    worker_id=worker.worker_id,
+                    reason=reason,
+                )
+            elif drain_state == "active":
+                self.ws_publisher.broadcast_worker_resume(
+                    worker_id=worker.worker_id,
+                )
+            
+            # Also broadcast state change if different
+            if old_state != worker.state:
+                self.ws_publisher.broadcast_worker_state_changed(
+                    worker_id=worker.worker_id,
+                    old_state=old_state,
+                    new_state=worker.state,
+                )
+        
         return worker
-
+    
     def drain_worker(self, worker_id: str, reason: Optional[str] = None) -> WorkerSnapshot:
-        """Put a worker into draining mode."""
+        """Put a worker into draining mode.
+        
+        WebSocket Hook: broadcasts worker.drain.
+        """
         return self.set_drain_state(worker_id, "draining", reason=reason)
 
     def resume_worker(self, worker_id: str) -> WorkerSnapshot:
@@ -263,9 +363,13 @@ class WorkerRegistry:
         )
 
     def _derive_state(self, worker: WorkerSnapshot) -> WorkerSnapshot:
-        """Derive worker state from heartbeat and lease."""
+        """Derive worker state from heartbeat and lease.
+        
+        WebSocket Hook: broadcasts worker.offline or worker.unhealthy if state changes.
+        """
         heartbeat = datetime.fromisoformat(worker.heartbeat_at.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
+        old_state = worker.state
         
         if worker.current_lease_id:
             try:
@@ -288,4 +392,24 @@ class WorkerRegistry:
             worker.state = "unhealthy"
         else:
             worker.state = "idle"
+        
+        # WebSocket hook for derived state changes
+        if self.ws_publisher and old_state != worker.state:
+            if worker.state == "offline":
+                self.ws_publisher.broadcast_worker_offline(
+                    worker_id=worker.worker_id,
+                    last_heartbeat_at=worker.heartbeat_at,
+                )
+            elif worker.state == "unhealthy":
+                self.ws_publisher.broadcast_worker_unhealthy(
+                    worker_id=worker.worker_id,
+                    error=worker.last_error,
+                )
+            else:
+                self.ws_publisher.broadcast_worker_state_changed(
+                    worker_id=worker.worker_id,
+                    old_state=old_state,
+                    new_state=worker.state,
+                )
+        
         return worker

@@ -76,6 +76,11 @@ class RuntimeService:
     - multi_agent: Parallel execution with Coordinator four-phase workflow
     
     Design source: Claude Plugin Module 05 - Coordinator Mode
+    
+    WebSocket Integration (added 2026-04-18):
+        - Injects WebSocketEventPublisher into fleet components
+        - Runs periodic health broadcast (60s interval)
+        - Events: worker.*, lease.*, queue.*, health.*
     """
 
     def __init__(
@@ -88,7 +93,21 @@ class RuntimeService:
         model_registry: ModelRegistry,
         orchestrator: OrchestratorService,
         prompt_assembler: PromptAssembler,
+        ws_publisher: Optional[Any] = None,  # WebSocketEventPublisher
     ) -> None:
+        """Initialize runtime service.
+        
+        Args:
+            database: PlatformStore for persistence
+            dispatch_queue: DispatchQueue for task routing
+            context_manager: ContextManager for context assembly
+            constraint_engine: ConstraintEngine for policy validation
+            tool_gateway: ToolGateway for tool execution
+            model_registry: ModelRegistry for model profiles
+            orchestrator: OrchestratorService for task planning
+            prompt_assembler: PromptAssembler for prompt generation
+            ws_publisher: WebSocketEventPublisher (optional, auto-initialized if None)
+        """
         self.database = database
         self.dispatch_queue = dispatch_queue
         self.context_manager = context_manager
@@ -97,7 +116,18 @@ class RuntimeService:
         self.model_registry = model_registry
         self.orchestrator = orchestrator
         self.prompt_assembler = prompt_assembler
-        self.worker_registry = WorkerRegistry(database)
+        self.ws_publisher = ws_publisher
+        
+        # Auto-initialize WebSocket publisher if not provided
+        if self.ws_publisher is None:
+            try:
+                from ..control_plane.websocket_publisher import get_publisher
+                self.ws_publisher = get_publisher()
+            except ImportError:
+                pass  # WebSocket not available, continue without
+        
+        # Initialize WorkerRegistry with WebSocket publisher
+        self.worker_registry = WorkerRegistry(database, ws_publisher=self.ws_publisher)
         self.dispatch_constraint_calculator = DispatchConstraintCalculator(
             tool_gateway=self.tool_gateway,
             worker_registry=self.worker_registry,
@@ -120,6 +150,7 @@ class RuntimeService:
                 database=database,
                 lease_timeout_seconds=self.lease_timeout_seconds,
                 existing_queue=dispatch_queue,  # Pass the same queue instance
+                ws_publisher=self.ws_publisher,
             )
         else:
             from ..fleet.dispatcher import Dispatcher
@@ -128,6 +159,7 @@ class RuntimeService:
                 worker_registry=self.worker_registry,
                 database=database,
                 lease_timeout_seconds=self.lease_timeout_seconds,
+                ws_publisher=self.ws_publisher,
             )
         
         # Create protocol adapters for LeaseManager
@@ -146,7 +178,12 @@ class RuntimeService:
             orchestrator=orchestrator,
             dispatcher=self.dispatcher,
             lease_timeout_seconds=self.lease_timeout_seconds,
+            ws_publisher=self.ws_publisher,
         )
+        
+        # Periodic health broadcast task
+        self._health_broadcast_task: Optional[asyncio.Task] = None
+        self._health_broadcast_interval = 60  # seconds
 
     def list_sessions(self, limit: int = 50) -> List[ResearchSession]:
         rows = self.database.fetchall("SELECT payload_json FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,))
@@ -2067,3 +2104,164 @@ class RuntimeService:
             "execution_context": result.execution_context,
             "ready_for_execution": result.ready_for_execution,
         }
+    
+    # === Periodic Health Broadcast ===
+    # Design source: WebSocket Runtime Hooks - 60s interval
+    
+    async def start_health_broadcast(self) -> None:
+        """Start periodic health broadcast task.
+        
+        Runs every 60 seconds to broadcast health.status event.
+        """
+        if self._health_broadcast_task is not None:
+            return  # Already running
+        
+        self._health_broadcast_task = asyncio.create_task(
+            self._health_broadcast_loop()
+        )
+    
+    async def stop_health_broadcast(self) -> None:
+        """Stop periodic health broadcast task."""
+        if self._health_broadcast_task is not None:
+            self._health_broadcast_task.cancel()
+            try:
+                await self._health_broadcast_task
+            except asyncio.CancelledError:
+                pass
+            self._health_broadcast_task = None
+    
+    async def _health_broadcast_loop(self) -> None:
+        """Periodic health broadcast loop.
+        
+        Every 60 seconds:
+        - Collect worker stats
+        - Collect queue depth
+        - Collect lease stats
+        - Broadcast health.status event
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._health_broadcast_interval)
+                await self._broadcast_health_status()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log error but continue
+                print(f"Health broadcast error: {e}")
+    
+    async def _broadcast_health_status(self) -> None:
+        """Collect and broadcast health status.
+        
+        Broadcasts health.status event with:
+        - Worker counts by state
+        - Queue depth by shard
+        - Active lease count
+        - Draining/unhealthy/offline workers
+        - Stuck runs
+        """
+        if self.ws_publisher is None:
+            return
+        
+        # Collect worker stats
+        workers = self.worker_registry.list_workers()
+        worker_count_by_state = {}
+        workers_by_role = {}
+        draining_workers = []
+        offline_workers = []
+        unhealthy_workers = []
+        
+        for worker in workers:
+            # Count by state
+            state = worker.state
+            worker_count_by_state[state] = worker_count_by_state.get(state, 0) + 1
+            
+            # Count by role
+            role = worker.role_profile or "general"
+            workers_by_role[role] = workers_by_role.get(role, 0) + 1
+            
+            # Track special states
+            if worker.drain_state == "draining":
+                draining_workers.append(worker.worker_id)
+            if worker.state == "offline":
+                offline_workers.append(worker.worker_id)
+            if worker.state == "unhealthy":
+                unhealthy_workers.append({
+                    "worker_id": worker.worker_id,
+                    "error": worker.last_error,
+                })
+        
+        # Collect queue stats
+        queue_depth_by_shard = self.dispatcher.get_queue_depth_by_shard()
+        queue_depth = sum(queue_depth_by_shard.values())
+        
+        # Collect lease stats
+        active_leases = [
+            lease for lease in self.database.list_leases()
+            if lease.status in {"leased", "running"}
+        ]
+        active_lease_count = len(active_leases)
+        
+        # Calculate lease reclaim rate
+        reclaimed = self.dispatcher.reclaimed_lease_count + self.lease_manager.reclaimed_lease_count
+        total_leases = sum(1 for _ in self.database.list_leases())
+        lease_reclaim_rate = reclaimed / max(total_leases, 1)
+        
+        # Find stuck runs (no heartbeat for 5+ minutes)
+        stuck_runs = self._find_stuck_runs()
+        
+        # Broadcast health status
+        self.ws_publisher.broadcast_health_status(
+            postgres_ready=True,  # TODO: actual check
+            redis_ready=True,  # TODO: actual check
+            worker_count=len(workers),
+            active_lease_count=active_lease_count,
+            queue_depth=queue_depth,
+            draining_workers=draining_workers,
+            offline_workers=offline_workers,
+            unhealthy_workers=unhealthy_workers,
+            stuck_runs=[{"run_id": r.run_id, "session_id": r.session_id} for r in stuck_runs],
+        )
+        
+        # Also broadcast fleet summary
+        self.ws_publisher.broadcast_fleet_summary(
+            worker_count_by_state=worker_count_by_state,
+            workers_by_role=workers_by_role,
+            queue_depth_by_shard=queue_depth_by_shard,
+            lease_reclaim_rate=lease_reclaim_rate,
+            stuck_run_count=len(stuck_runs),
+        )
+    
+    def _find_stuck_runs(self, stuck_threshold_minutes: int = 5) -> List[ResearchRun]:
+        """Find runs that appear stuck.
+        
+        A run is considered stuck if:
+        - Status is "running" or "queued"
+        - No heartbeat in last 5 minutes
+        
+        Args:
+            stuck_threshold_minutes: Minutes without heartbeat
+            
+        Returns:
+            List of stuck ResearchRun
+        """
+        threshold = datetime.now(timezone.utc) - timedelta(minutes=stuck_threshold_minutes)
+        stuck_runs = []
+        
+        for run in self.database.list_runs():
+            if run.status in {"running", "queued"}:
+                # Check if run has active lease with recent heartbeat
+                if run.active_lease_id:
+                    try:
+                        lease = self.database.get_lease(run.active_lease_id)
+                        heartbeat = datetime.fromisoformat(lease.heartbeat_at.replace("Z", "+00:00"))
+                        if heartbeat < threshold:
+                            stuck_runs.append(run)
+                    except ValueError:
+                        pass
+                else:
+                    # No active lease but still running - might be stuck
+                    run_updated = datetime.fromisoformat(run.updated_at.replace("Z", "+00:00"))
+                    if run_updated < threshold:
+                        stuck_runs.append(run)
+        
+        return stuck_runs

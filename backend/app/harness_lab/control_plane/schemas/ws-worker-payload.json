@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ws-worker-payload.json",
+  "title": "WebSocket Worker Payload",
+  "description": "Payload schema for worker-related WebSocket events",
+  "type": "object",
+  "definitions": {
+    "WorkerSnapshot": {
+      "type": "object",
+      "required": ["worker_id", "state"],
+      "properties": {
+        "worker_id": {
+          "type": "string",
+          "description": "Unique worker identifier"
+        },
+        "state": {
+          "type": "string",
+          "description": "Worker state",
+          "enum": ["idle", "leased", "executing", "offline", "unhealthy", "draining"]
+        },
+        "role": {
+          "type": "string",
+          "description": "Worker role profile (planner, executor, researcher, reviewer, recovery)"
+        },
+        "role_profile": {
+          "type": "string",
+          "description": "Worker role profile name"
+        },
+        "hostname": {
+          "type": "string",
+          "description": "Worker hostname"
+        },
+        "pid": {
+          "type": "integer",
+          "description": "Worker process ID"
+        },
+        "current_run_id": {
+          "type": "string",
+          "description": "Current run ID if executing"
+        },
+        "current_lease_id": {
+          "type": "string",
+          "description": "Current lease ID if leased/executing"
+        },
+        "heartbeat_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last heartbeat timestamp"
+        },
+        "drain_state": {
+          "type": "object",
+          "description": "Drain state information",
+          "properties": {
+            "draining": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "initiator": {
+              "type": "string"
+            }
+          }
+        },
+        "sandbox_backend": {
+          "type": "string",
+          "description": "Sandbox backend type"
+        },
+        "sandbox_ready": {
+          "type": "boolean",
+          "description": "Whether sandbox is ready"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "description": "Worker joined event payload",
+      "required": ["worker_id", "role", "state"],
+      "properties": {
+        "worker_id": {"type": "string"},
+        "role": {"type": "string"},
+        "state": {"type": "string", "enum": ["idle", "leased", "executing"]},
+        "hostname": {"type": "string"},
+        "pid": {"type": "integer"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Worker left event payload",
+      "required": ["worker_id"],
+      "properties": {
+        "worker_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Worker state changed event payload",
+      "required": ["worker_id", "old_state", "new_state"],
+      "properties": {
+        "worker_id": {"type": "string"},
+        "old_state": {"type": "string"},
+        "new_state": {"type": "string"},
+        "task_id": {"type": "string"},
+        "lease_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Worker drain event payload",
+      "required": ["worker_id"],
+      "properties": {
+        "worker_id": {"type": "string"},
+        "reason": {"type": "string"},
+        "initiator": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Worker resume event payload",
+      "required": ["worker_id"],
+      "properties": {
+        "worker_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Task dispatched event payload",
+      "required": ["task_id", "worker_id"],
+      "properties": {
+        "task_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "lease_id": {"type": "string"},
+        "task_type": {"type": "string"},
+        "run_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Task completed/failed event payload",
+      "required": ["task_id", "worker_id", "success"],
+      "properties": {
+        "task_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "success": {"type": "boolean"},
+        "duration_seconds": {"type": "number"},
+        "error": {"type": "string"},
+        "lease_id": {"type": "string"},
+        "run_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Initial state snapshot - workers list",
+      "required": ["workers", "count"],
+      "properties": {
+        "workers": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/WorkerSnapshot"}
+        },
+        "count": {"type": "integer"},
+        "by_state": {
+          "type": "object",
+          "additionalProperties": {"type": "integer"}
+        },
+        "by_role": {
+          "type": "object",
+          "additionalProperties": {"type": "integer"}
+        }
+      }
+    }
+  ]
+}

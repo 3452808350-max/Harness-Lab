@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://harness.lab/schemas/ws-worker-payload.json",
+  "title": "WorkerEventPayload",
+  "description": "Payload schema for worker-related WebSocket events",
+  "type": "object",
+  "properties": {
+    "worker_id": {
+      "type": "string",
+      "description": "Unique worker identifier"
+    },
+    "label": {
+      "type": "string",
+      "description": "Human-readable worker label"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["registering", "idle", "leased", "executing", "draining", "offline", "unhealthy"],
+      "description": "Current worker state"
+    },
+    "previous_state": {
+      "type": "string",
+      "enum": ["registering", "idle", "leased", "executing", "draining", "offline", "unhealthy"],
+      "description": "Previous worker state (for state change events)"
+    },
+    "current_state": {
+      "type": "string",
+      "enum": ["registering", "idle", "leased", "executing", "draining", "offline", "unhealthy"],
+      "description": "Current worker state (alias for state)"
+    },
+    "role_profile": {
+      "type": "string",
+      "enum": ["planner", "researcher", "executor", "reviewer", "recovery"],
+      "description": "Agent role profile"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Worker capabilities"
+    },
+    "hostname": {
+      "type": "string",
+      "description": "Worker hostname"
+    },
+    "pid": {
+      "type": "integer",
+      "description": "Worker process ID"
+    },
+    "labels": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Worker labels for matching"
+    },
+    "current_run_id": {
+      "type": "string",
+      "description": "Currently executing run ID"
+    },
+    "current_task_node_id": {
+      "type": "string",
+      "description": "Currently executing task node ID"
+    },
+    "current_lease_id": {
+      "type": "string",
+      "description": "Current active lease ID"
+    },
+    "lease_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of active leases"
+    },
+    "heartbeat_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last heartbeat timestamp"
+    },
+    "drain_state": {
+      "type": "string",
+      "enum": ["active", "draining"],
+      "description": "Drain state"
+    },
+    "sandbox_backend": {
+      "type": "string",
+      "description": "Sandbox backend type"
+    },
+    "sandbox_ready": {
+      "type": "boolean",
+      "description": "Sandbox readiness status"
+    },
+    "last_error": {
+      "type": "string",
+      "description": "Last error message"
+    },
+    "workers": {
+      "type": "array",
+      "items": {"type": "object"},
+      "description": "Array of worker snapshots (for worker_list_snapshot)"
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total worker count (for snapshots)"
+    },
+    "filters": {
+      "type": "object",
+      "description": "Active filters for the connection"
+    }
+  },
+  "required": ["worker_id", "state"]
+}

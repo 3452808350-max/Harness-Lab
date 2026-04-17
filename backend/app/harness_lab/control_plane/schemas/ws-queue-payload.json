@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ws-queue-payload.json",
+  "title": "WebSocket Queue Payload",
+  "description": "Payload schema for queue-related WebSocket events",
+  "type": "object",
+  "definitions": {
+    "QueueShardStatus": {
+      "type": "object",
+      "required": ["shard_id", "depth"],
+      "properties": {
+        "shard_id": {
+          "type": "string",
+          "description": "Queue shard identifier"
+        },
+        "depth": {
+          "type": "integer",
+          "description": "Number of items in queue",
+          "minimum": 0
+        },
+        "pending_tasks": {
+          "type": "integer",
+          "description": "Number of pending tasks",
+          "minimum": 0
+        },
+        "active_leases": {
+          "type": "integer",
+          "description": "Number of active leases",
+          "minimum": 0
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Queue namespace"
+        },
+        "last_activity": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last activity timestamp"
+        },
+        "healthy": {
+          "type": "boolean",
+          "description": "Whether queue shard is healthy"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "description": "Queue update event payload",
+      "required": ["queues"],
+      "properties": {
+        "queues": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/QueueShardStatus"}
+        }
+      }
+    },
+    {
+      "type": "object",
+      "description": "Queue shard update event payload",
+      "required": ["shard_id", "depth"],
+      "properties": {
+        "shard_id": {"type": "string"},
+        "depth": {"type": "integer"},
+        "pending_tasks": {"type": "integer"},
+        "active_leases": {"type": "integer"},
+        "namespace": {"type": "string"},
+        "healthy": {"type": "boolean"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Queue depth change event payload",
+      "required": ["shard_id", "old_depth", "new_depth"],
+      "properties": {
+        "shard_id": {"type": "string"},
+        "old_depth": {"type": "integer"},
+        "new_depth": {"type": "integer"},
+        "change": {"type": "integer"},
+        "reason": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Initial state snapshot - queue status",
+      "required": ["queue_status", "pending_tasks", "active_leases"],
+      "properties": {
+        "queue_status": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/QueueShardStatus"}
+        },
+        "pending_tasks": {"type": "integer"},
+        "active_leases": {"type": "integer"},
+        "total_depth": {"type": "integer"},
+        "healthy_shards": {"type": "integer"},
+        "unhealthy_shards": {"type": "integer"}
+      }
+    }
+  ]
+}

@@ -2,6 +2,10 @@
 Worker Detail Screen - Detailed worker management view.
 
 Shows comprehensive worker details and allows drain/resume operations.
+
+WebSocket Integration:
+- Receives real-time state changes via WebSocket events from Dashboard
+- Falls back to HTTP polling when WebSocket disconnected
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ from textual.widgets import (
 from ..api_client import ControlPlaneClient, APIConfig
 from ..theme import ColorTheme
 from ..widgets import StatusBar
+from ..ws_client import ConnectionState
+from ..ws_worker import WSWorkerStateChanged, WSTaskDispatched, WSTaskCompleted
 
 
 # State color mapping with emoji indicators
@@ -35,7 +41,7 @@ STATE_COLORS = {
     "draining": "🟡",
     "offline": "⚫",
     "unhealthy": "🔴",
-    "registering": "🔵",
+    "registering": "🟢",
 }
 
 

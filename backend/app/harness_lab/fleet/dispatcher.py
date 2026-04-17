@@ -8,6 +8,10 @@ Design:
     - Dispatcher owns the queue and matching algorithm
     - WorkerRegistry provides worker state
     - LeaseManager owns lease lifecycle
+
+WebSocket Hooks (added 2026-04-18):
+    - _create_dispatch: broadcasts lease.acquired and queue.dispatched
+    - _reclaim_lease: broadcasts lease.expired (via LeaseManager)
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ if TYPE_CHECKING:
         DispatchConstraintProtocol,
         DispatchContextProtocol,
     )
+    from ..control_plane.websocket_publisher import WebSocketEventPublisher
 
 
 class Dispatcher:
@@ -37,6 +42,10 @@ class Dispatcher:
     
     Combines queue management from dispatch_queue.py with
     matching logic from LeaseManager.
+    
+    WebSocket Integration:
+        Optionally publishes dispatch events via WebSocketEventPublisher.
+        Events: lease.acquired, queue.dispatched, queue.enqueued
     """
     
     def __init__(
@@ -45,6 +54,7 @@ class Dispatcher:
         worker_registry,
         database: PlatformStore,
         lease_timeout_seconds: int = 30,
+        ws_publisher: Optional[WebSocketEventPublisher] = None,
     ) -> None:
         """Initialize dispatcher.
         
@@ -53,12 +63,18 @@ class Dispatcher:
             worker_registry: WorkerRegistry for worker state
             database: PlatformStore for persistence
             lease_timeout_seconds: Default lease timeout
+            ws_publisher: WebSocketEventPublisher (optional)
         """
         self.queue = queue
         self.worker_registry = worker_registry
         self.database = database
         self.lease_timeout_seconds = lease_timeout_seconds
+        self.ws_publisher = ws_publisher
         self.reclaimed_lease_count = 0
+    
+    def set_ws_publisher(self, publisher: WebSocketEventPublisher) -> None:
+        """Set WebSocket publisher after initialization."""
+        self.ws_publisher = publisher
     
     def get_queue_depth(self, shard: Optional[str] = None) -> int:
         """Get depth of ready queue."""
@@ -183,6 +199,8 @@ class Dispatcher:
         
         This method performs the actual lease creation and state updates
         atomically within a database transaction.
+        
+        WebSocket Hook: broadcasts lease.acquired and queue.dispatched.
         """
         from ..types import TaskAttempt, WorkerLease
         from ..utils import new_id, utc_now
@@ -318,6 +336,27 @@ class Dispatcher:
             lease.lease_id,
             datetime.fromisoformat(lease.expires_at.replace("Z", "+00:00")).timestamp()
         )
+        
+        # Get shard from constraints
+        constraint_info = constraints.constraint_for_node(node, session)
+        shard = constraint_info.queue_shard or "general/normal/unlabeled"
+        
+        # WebSocket hooks: broadcast lease acquired and queue dispatched
+        if self.ws_publisher:
+            self.ws_publisher.broadcast_lease_acquired(
+                lease_id=lease.lease_id,
+                worker_id=worker_id,
+                task_node_id=node.node_id,
+                run_id=run.run_id,
+                attempt_id=attempt.attempt_id,
+            )
+            self.ws_publisher.broadcast_queue_dispatched(
+                shard=shard,
+                task_node_id=node.node_id,
+                worker_id=worker_id,
+                lease_id=lease.lease_id,
+                run_id=run.run_id,
+            )
         
         # Build and return dispatch envelope
         return context.build_dispatch(run, session, node, worker, lease.lease_id, attempt.attempt_id)
@@ -757,6 +796,7 @@ class InMemoryDispatcher(Dispatcher):
         database: PlatformStore,
         lease_timeout_seconds: int = 30,
         existing_queue=None,
+        ws_publisher=None,
     ) -> None:
         from ..dispatch_queue import InMemoryDispatchQueue
         super().__init__(
@@ -764,4 +804,5 @@ class InMemoryDispatcher(Dispatcher):
             worker_registry=worker_registry,
             database=database,
             lease_timeout_seconds=lease_timeout_seconds,
+            ws_publisher=ws_publisher,
         )

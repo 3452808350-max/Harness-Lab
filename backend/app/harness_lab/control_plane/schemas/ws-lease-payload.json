@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ws-lease-payload.json",
+  "title": "WebSocket Lease Payload",
+  "description": "Payload schema for lease-related WebSocket events",
+  "type": "object",
+  "definitions": {
+    "LeaseSnapshot": {
+      "type": "object",
+      "required": ["lease_id", "status"],
+      "properties": {
+        "lease_id": {
+          "type": "string",
+          "description": "Unique lease identifier"
+        },
+        "worker_id": {
+          "type": "string",
+          "description": "Worker holding the lease"
+        },
+        "run_id": {
+          "type": "string",
+          "description": "Associated run ID"
+        },
+        "status": {
+          "type": "string",
+          "description": "Lease status",
+          "enum": ["pending", "active", "completed", "failed", "released", "expired"]
+        },
+        "lease_type": {
+          "type": "string",
+          "description": "Type of lease"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Expiration timestamp"
+        },
+        "heartbeat_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last heartbeat timestamp"
+        },
+        "task_node_key": {
+          "type": "string",
+          "description": "Associated task node key"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "description": "Lease created event payload",
+      "required": ["lease_id", "worker_id"],
+      "properties": {
+        "lease_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "lease_type": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Lease released event payload",
+      "required": ["lease_id"],
+      "properties": {
+        "lease_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "reason": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Lease expired event payload",
+      "required": ["lease_id"],
+      "properties": {
+        "lease_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "run_id": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Lease heartbeat event payload",
+      "required": ["lease_id"],
+      "properties": {
+        "lease_id": {"type": "string"},
+        "worker_id": {"type": "string"},
+        "heartbeat_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    {
+      "type": "object",
+      "description": "Initial state snapshot - leases list",
+      "required": ["leases", "count"],
+      "properties": {
+        "leases": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/LeaseSnapshot"}
+        },
+        "count": {"type": "integer"},
+        "active": {"type": "integer"},
+        "pending": {"type": "integer"},
+        "completed": {"type": "integer"},
+        "failed": {"type": "integer"},
+        "expired": {"type": "integer"}
+      }
+    }
+  ]
+}
