@@ -14,7 +14,11 @@ Harness Lab 是一个研究优先、可回放、面向生产化演进的多 agen
 | **远程 Worker 协议** | Lease-driven polling + heartbeat |
 | **可插拔 Sandbox** | Docker (生产) / MicroVM (VM 隔离) / Stub (测试) |
 | **自我改进循环** | Trace 诊断 → Candidate 生成 → Benchmark 验证 |
-| **SOCKS5 安全代理** | Worker 远程通信安全隧道 (新增) |
+| **SOCKS5 安全代理** | Worker 远程通信安全隧道 |
+| **Terminal UI (TUI)** | Textual 可视化管理界面 (新增) |
+| **Worker Auto-Pair** | 自动角色检测与配置 (新增) |
+| **Systemd 服务** | 生产级 systemd 部署 (新增) |
+| **一键 Bootstrap** | 完整基础设施部署脚本 (新增) |
 
 ---
 
@@ -60,6 +64,70 @@ Control Plane ←── Lease Polling ──→ Worker
                 ├── Heartbeat (健康检查)
                 ├── Dispatch (任务分发)
                 └── Status Update (状态同步)
+```
+
+---
+
+## 快速开始
+
+### 一键部署（推荐）
+
+```bash
+# Control Plane 完整部署（PostgreSQL + Redis + Docker + API）
+curl -sSL https://raw.githubusercontent.com/3452808350-max/Harness-Lab/main/scripts/bootstrap-control-plane.sh | bash
+
+# 或本地运行
+./scripts/bootstrap-control-plane.sh --port 4600 --with-worker
+```
+
+### Systemd 服务管理
+
+```bash
+# 安装 systemd 服务（开机自启）
+./scripts/install-systemd.sh
+
+# 管理命令
+sudo systemctl start harness-lab    # 启动
+sudo systemctl stop harness-lab     # 停止
+sudo systemctl status harness-lab   # 状态
+sudo journalctl -u harness-lab -f   # 日志
+```
+
+### Terminal UI (TUI)
+
+```bash
+# 启动可视化管理界面
+hlab tui control [--port 4600] [--theme dark|light]
+
+# Worker 详情页
+hlab tui worker [--worker-id ID]
+
+# 快速状态检查
+hlab tui status [--live]
+```
+
+**TUI 快捷键：**
+
+| 按键 | 功能 |
+|------|------|
+| `i` | 查看选中 Worker 详情 |
+| `d` | Drain Worker |
+| `r` | Resume Worker |
+| `l` | 切换 Leases 显示 |
+| `h` | 强制 Heartbeat |
+| `q` | 退出 |
+
+### Worker Auto-Pair
+
+```bash
+# 自动检测角色并配置
+hlab worker auto-pair --role executor --label my-worker
+
+# 支持角色模板
+# - general: 通用 Worker
+# - executor: 执行 Worker
+# - reviewer: 审核 Worker
+# - planner: 规划 Worker
 ```
 
 ---
@@ -165,6 +233,34 @@ npm run dev
 
 ## CLI 命令参考
 
+### TUI 命令 (新增)
+
+| 命令 | 说明 |
+|------|------|
+| `hlab tui control` | 启动 Control Plane TUI Dashboard |
+| `hlab tui worker [--worker-id ID]` | Worker 详情页 |
+| `hlab tui status [--live]` | 快速状态检查（非交互） |
+
+### Systemd 命令 (新增)
+
+| 命令 | 说明 |
+|------|------|
+| `sudo systemctl start harness-lab` | 启动服务 |
+| `sudo systemctl stop harness-lab` | 停止服务 |
+| `sudo systemctl status harness-lab` | 查看状态 |
+| `sudo systemctl restart harness-lab` | 重启服务 |
+| `sudo journalctl -u harness-lab -f` | 实时日志 |
+
+### Bootstrap 命令 (新增)
+
+| 命令 | 说明 |
+|------|------|
+| `./scripts/bootstrap-control-plane.sh` | Control Plane 完整部署 |
+| `./scripts/bootstrap-worker.sh` | Worker 远程部署 |
+| `./scripts/install-systemd.sh` | Systemd 服务安装 |
+| `./scripts/update.sh [--check]` | 安全更新脚本 |
+| `./scripts/uninstall.sh [--keep-data]` | 卸载脚本 |
+
 ### 基础命令
 
 | 命令 | 说明 |
@@ -193,6 +289,7 @@ npm run dev
 
 | 命令 | 说明 |
 |------|------|
+| `hlab worker auto-pair [--role ROLE]` | 自动角色检测与配置 (新增) |
 | `hlab worker register [--label NAME]` | 注册新 Worker |
 | `hlab worker status <worker-id>` | Worker 详细状态 |
 | `hlab worker drain <worker-id>` | 暂停 Worker 任务 |
