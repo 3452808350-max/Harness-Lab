@@ -38,7 +38,7 @@ ROLE="general"
 LABEL=""
 SERVE=false
 DRY_RUN=false
-REPO_URL="https://github.com/openclaw/homelab.git"
+REPO_URL="https://github.com/3452808350-max/Harness-Lab.git"
 INSTALL_DIR="${HOME}/.harness-lab"
 
 # Parse arguments
