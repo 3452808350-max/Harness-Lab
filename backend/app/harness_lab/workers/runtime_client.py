@@ -11,6 +11,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+# SOCKS5 support (optional dependency)
+try:
+    import socks
+    SOCKS5_AVAILABLE = True
+except ImportError:
+    SOCKS5_AVAILABLE = False
+
 from ..artifact_store import ArtifactStore, LocalFilesystemArtifactStore, create_artifact_store
 from ..boundary.gateway import ToolGateway
 from ..boundary.sandbox import SandboxManager
@@ -86,10 +93,39 @@ class WorkerRuntimeClient:
         control_plane_url: str,
         request_fn: Optional[JsonTransport] = None,
         timeout_seconds: float = 30.0,
+        socks5_proxy_url: Optional[str] = None,
     ) -> None:
         self.control_plane_url = control_plane_url.rstrip("/")
         self.request_fn = request_fn
         self.timeout_seconds = timeout_seconds
+        self.socks5_proxy_url = socks5_proxy_url
+        self._socks5_initialized = False
+
+    def _init_socks5(self) -> None:
+        """Initialize SOCKS5 proxy for urllib."""
+        if self._socks5_initialized or not self.socks5_proxy_url:
+            return
+        if not SOCKS5_AVAILABLE:
+            raise RuntimeError("PySocks not installed. Run: pip install pysocks")
+        # Parse SOCKS5 URL: socks5://[user:pass@]host:port
+        proxy_url = self.socks5_proxy_url
+        if proxy_url.startswith("socks5://"):
+            proxy_url = proxy_url[9:]
+        auth_host_port = proxy_url.split("@")
+        if len(auth_host_port) == 2:
+            # Has authentication
+            auth, host_port = auth_host_port
+            user, pass_ = auth.split(":")
+            host, port_str = host_port.split(":")
+            port = int(port_str)
+            socks.set_default_proxy(socks.SOCKS5, host, port, username=user, password=pass_)
+        else:
+            # No authentication
+            host, port_str = auth_host_port[0].split(":")
+            port = int(port_str)
+            socks.set_default_proxy(socks.SOCKS5, host, port)
+        socks.wrap_module(urllib.request)
+        self._socks5_initialized = True
 
     def register_worker(self, request: WorkerRegisterRequest) -> WorkerSnapshot:
         payload = self._request("POST", "/api/workers/register", request.model_dump(exclude_none=True))
@@ -149,6 +185,8 @@ class WorkerRuntimeClient:
     def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.request_fn:
             return self.request_fn(method, path, payload)
+        # Initialize SOCKS5 proxy if configured
+        self._init_socks5()
         body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             url=f"{self.control_plane_url}{path}",

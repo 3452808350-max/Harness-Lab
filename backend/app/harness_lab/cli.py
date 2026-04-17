@@ -54,7 +54,23 @@ def _default_control_plane_url() -> str:
     if configured:
         return configured.rstrip("/")
     port = os.getenv("PORT", "4600").strip() or "4600"
-    return f"http://127.0.0.1:{port}"
+    # Support HTTPS if configured
+    use_https = os.getenv("HARNESS_USE_HTTPS", "false").strip().lower() in {"1", "true", "yes", "on"}
+    scheme = "https" if use_https else "http"
+    return f"{scheme}://127.0.0.1:{port}"
+
+
+def _get_socks5_proxy_url() -> str | None:
+    """Get SOCKS5 proxy URL from environment."""
+    host = os.getenv("HARNESS_SOCKS5_PROXY_HOST")
+    port = os.getenv("HARNESS_SOCKS5_PROXY_PORT")
+    if not host or not port:
+        return None
+    user = os.getenv("HARNESS_SOCKS5_PROXY_USER")
+    pass_ = os.getenv("HARNESS_SOCKS5_PROXY_PASS")
+    if user and pass_:
+        return f"socks5://{user}:{pass_}@{host}:{port}"
+    return f"socks5://{host}:{port}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -216,7 +232,7 @@ def main() -> None:
     if args.command == "knowledge":
         if args.knowledge_command == "reindex":
             if args.control_plane_url.strip():
-                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                client = WorkerRuntimeClient(args.control_plane_url.strip(), socks5_proxy_url=_get_socks5_proxy_url())
                 payload = client.reindex_knowledge(KnowledgeReindexRequest(scope=args.scope))
                 _emit(payload["data"], args.output_format)
                 return
@@ -232,7 +248,7 @@ def main() -> None:
                 source_types=args.source_type,
             )
             if args.control_plane_url.strip():
-                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                client = WorkerRuntimeClient(args.control_plane_url.strip(), socks5_proxy_url=_get_socks5_proxy_url())
                 payload = client.search_knowledge(request)
                 _emit(payload["data"], args.output_format)
                 return
@@ -519,7 +535,7 @@ def main() -> None:
         if args.worker_command == "register":
             control_plane_url = args.control_plane_url.strip()
             if control_plane_url:
-                client = WorkerRuntimeClient(control_plane_url)
+                client = WorkerRuntimeClient(control_plane_url, socks5_proxy_url=_get_socks5_proxy_url())
                 loop = WorkerExecutionLoop(client, poll_interval_seconds=1.0)
                 worker = loop.register(
                     worker_id=args.worker_id or None,
@@ -545,7 +561,7 @@ def main() -> None:
 
         if args.worker_command == "status":
             if args.control_plane_url.strip():
-                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                client = WorkerRuntimeClient(args.control_plane_url.strip(), socks5_proxy_url=_get_socks5_proxy_url())
                 worker_detail = client.get_worker(args.worker_id)
                 _emit(worker_detail, args.output_format)
                 return
@@ -576,7 +592,7 @@ def main() -> None:
 
         if args.worker_command == "drain":
             if args.control_plane_url.strip():
-                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                client = WorkerRuntimeClient(args.control_plane_url.strip(), socks5_proxy_url=_get_socks5_proxy_url())
                 worker = client.drain_worker(args.worker_id, args.reason or None)
                 _emit(worker.model_dump(), args.output_format)
                 return
@@ -586,7 +602,7 @@ def main() -> None:
 
         if args.worker_command == "resume":
             if args.control_plane_url.strip():
-                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                client = WorkerRuntimeClient(args.control_plane_url.strip(), socks5_proxy_url=_get_socks5_proxy_url())
                 worker = client.resume_worker(args.worker_id)
                 _emit(worker.model_dump(), args.output_format)
                 return
@@ -596,7 +612,7 @@ def main() -> None:
 
         if args.worker_command == "serve":
             control_plane_url = args.control_plane_url.strip() or _default_control_plane_url()
-            client = WorkerRuntimeClient(control_plane_url)
+            client = WorkerRuntimeClient(control_plane_url, socks5_proxy_url=_get_socks5_proxy_url())
             loop = WorkerExecutionLoop(client, poll_interval_seconds=max(0.1, args.interval))
             result = loop.serve(
                 worker_id=args.worker_id or None,

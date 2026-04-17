@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field
 class HarnessLabSettings(BaseModel):
     db_url: str = Field(..., alias="HARNESS_DB_URL")
     redis_url: str = Field(..., alias="HARNESS_REDIS_URL")
+    # SOCKS5 proxy settings for secure worker communication
+    socks5_proxy_host: str | None = Field(None, alias="HARNESS_SOCKS5_PROXY_HOST")
+    socks5_proxy_port: int | None = Field(None, alias="HARNESS_SOCKS5_PROXY_PORT")
+    socks5_proxy_user: str | None = Field(None, alias="HARNESS_SOCKS5_PROXY_USER")
+    socks5_proxy_pass: str | None = Field(None, alias="HARNESS_SOCKS5_PROXY_PASS")
     worker_poll_interval: float = Field(1.0, alias="HARNESS_WORKER_POLL_INTERVAL")
     host: str = Field("0.0.0.0", alias="HOST")
     port: int = Field(4600, alias="PORT")
@@ -70,6 +75,11 @@ class HarnessLabSettings(BaseModel):
             "HARNESS_SANDBOX_ROOTLESS_USER": os.getenv("HARNESS_SANDBOX_ROOTLESS_USER", "1000:1000"),
             "HARNESS_SANDBOX_NO_NEW_PRIVILEGES": os.getenv("HARNESS_SANDBOX_NO_NEW_PRIVILEGES", "true"),
             "HARNESS_SANDBOX_CAP_DROP_ALL": os.getenv("HARNESS_SANDBOX_CAP_DROP_ALL", "true"),
+            # SOCKS5 proxy settings
+            "HARNESS_SOCKS5_PROXY_HOST": os.getenv("HARNESS_SOCKS5_PROXY_HOST"),
+            "HARNESS_SOCKS5_PROXY_PORT": os.getenv("HARNESS_SOCKS5_PROXY_PORT"),
+            "HARNESS_SOCKS5_PROXY_USER": os.getenv("HARNESS_SOCKS5_PROXY_USER"),
+            "HARNESS_SOCKS5_PROXY_PASS": os.getenv("HARNESS_SOCKS5_PROXY_PASS"),
         }
         settings = cls.model_validate(env)
         settings.validate_runtime_backends()
@@ -87,6 +97,21 @@ class HarnessLabSettings(BaseModel):
             raise RuntimeError("HARNESS_ARTIFACT_BACKEND must be either 'local' or 's3'.")
         if self.sandbox_backend not in {"docker", "microvm", "microvm_stub"}:
             raise RuntimeError("HARNESS_SANDBOX_BACKEND must be one of 'docker', 'microvm', or 'microvm_stub'.")
+        # Validate SOCKS5 proxy settings
+        if self.socks5_proxy_host and not self.socks5_proxy_port:
+            raise RuntimeError("HARNESS_SOCKS5_PROXY_PORT is required when HARNESS_SOCKS5_PROXY_HOST is set.")
+
+    def has_socks5_proxy(self) -> bool:
+        """Check if SOCKS5 proxy is configured."""
+        return self.socks5_proxy_host is not None and self.socks5_proxy_port is not None
+
+    def socks5_proxy_url(self) -> str | None:
+        """Build SOCKS5 proxy URL with authentication if configured."""
+        if not self.has_socks5_proxy():
+            return None
+        if self.socks5_proxy_user and self.socks5_proxy_pass:
+            return f"socks5://{self.socks5_proxy_user}:{self.socks5_proxy_pass}@{self.socks5_proxy_host}:{self.socks5_proxy_port}"
+        return f"socks5://{self.socks5_proxy_host}:{self.socks5_proxy_port}"
 
     def resolved_artifact_root(self) -> str | None:
         if self.artifact_root:
